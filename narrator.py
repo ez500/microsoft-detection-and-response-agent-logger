@@ -7,14 +7,19 @@ narration if the API is unavailable.
 """
 
 import json
+import logging
 import textwrap
 from datetime import datetime
 from typing import Dict, List, Optional
 
+from agent_trace import get_logger, instrument
 from config import Config
 from events import AuditEvent, EventType, Severity
 
+logger = logging.getLogger(__name__)
 
+
+@instrument(agent_name="LLMNarrator")
 class LLMNarrator:
     """
     Enhances structured audit events with LLM-generated verbose narratives
@@ -93,6 +98,16 @@ class LLMNarrator:
 
     def _llm_narrate(self, events: List[AuditEvent]) -> List[AuditEvent]:
         """Use Gemini to generate verbose narratives for each event."""
+        # Record cognitive event for LLM call
+        alogger = get_logger()
+        if alogger:
+            alogger.record_cognitive(
+                model=self.config.llm_model,
+                prompt_summary=f"Narrating {len(events)} events",
+                completion_summary="pending",
+                temperature=self.config.llm_temperature,
+            )
+
         # Build a prompt with all events
         event_descriptions = []
         for i, event in enumerate(events):
@@ -131,6 +146,22 @@ class LLMNarrator:
         response = self._model.generate_content(prompt)
         text = response.text
 
+        # Record cognitive event for LLM completion with cognitive extraction
+        if alogger:
+            # Extract thinking segments from the response
+            thought_segments = []
+            import re
+            thinking_matches = re.findall(r"<thinking>(.*?)</thinking>", text, re.DOTALL)
+            for segment in thinking_matches:
+                thought_segments.append(segment.strip())
+            alogger.record_cognitive(
+                model=self.config.llm_model,
+                thought="\n".join(thought_segments) if thought_segments else None,
+                completion_summary=text[:200],
+                total_tokens=len(text.split()),
+                temperature=self.config.llm_temperature,
+            )
+
         # Parse the response
         narratives: Dict[int, str] = {}
         for line in text.splitlines():
@@ -155,6 +186,16 @@ class LLMNarrator:
 
     def _llm_generate_report(self, events: List[AuditEvent], date_str: str) -> str:
         """Use Gemini to generate a full Markdown audit report."""
+        # Record cognitive event for report generation
+        alogger = get_logger()
+        if alogger:
+            alogger.record_cognitive(
+                model=self.config.llm_model,
+                plan=f"Generate comprehensive audit report for {date_str}",
+                prompt_summary=f"Report generation with {len(events)} events",
+                temperature=self.config.llm_temperature,
+            )
+
         event_summaries = []
         for event in events:
             event_summaries.append(
@@ -200,6 +241,17 @@ class LLMNarrator:
         """)
 
         response = self._model.generate_content(prompt)
+
+        # Record cognitive event for completion
+        if alogger:
+            alogger.record_cognitive(
+                model=self.config.llm_model,
+                completion_summary=f"Report generated: {len(response.text)} chars",
+                total_tokens=len(response.text.split()),
+                temperature=self.config.llm_temperature,
+                reflection="Report contains executive summary, timeline, correlation activity, entity intelligence, anomalies, and statistics",
+            )
+
         return response.text
 
     # ── Template fallback ─────────────────────────────────────────────────

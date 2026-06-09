@@ -7,14 +7,19 @@ Writes structured audit events to two output formats:
 """
 
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
+from agent_trace import get_logger, instrument
 from config import Config
 from events import AuditEvent, make_pipeline_complete_event
 
+logger = logging.getLogger(__name__)
 
+
+@instrument(agent_name="AuditLogWriter")
 class AuditLogWriter:
     """
     Writes audit events to JSONL and Markdown output files.
@@ -38,10 +43,30 @@ class AuditLogWriter:
         """
         out_path = self.config.log_dir / f"{date_str}.jsonl"
 
+        # Record contextual event for file I/O
+        alogger = get_logger()
+        if alogger:
+            alogger.record_contextual(
+                operation="file_write",
+                source=str(out_path),
+                query_summary=f"Writing {len(events)} events",
+                byte_count=0,
+            )
+
         # Open in append mode so multiple runs can add to the same day
         with open(out_path, "a", encoding="utf-8") as f:
             for event in events:
                 f.write(json.dumps(event.to_dict(), default=str) + "\n")
+
+        # Record completion with actual byte count
+        if alogger:
+            byte_count = out_path.stat().st_size if out_path.exists() else 0
+            alogger.record_contextual(
+                operation="file_write_complete",
+                source=str(out_path),
+                response_summary=f"Wrote {len(events)} events ({byte_count} bytes)",
+                byte_count=byte_count,
+            )
 
         return out_path
 
@@ -63,7 +88,28 @@ class AuditLogWriter:
             Path to the written report file.
         """
         out_path = self.config.report_dir / f"{date_str}.md"
+
+        # Record contextual event for report write
+        alogger = get_logger()
+        if alogger:
+            alogger.record_contextual(
+                operation="file_write",
+                source=str(out_path),
+                query_summary=f"Writing Markdown report ({len(report_content)} chars)",
+                byte_count=len(report_content.encode("utf-8")),
+            )
+
         out_path.write_text(report_content, encoding="utf-8")
+
+        if alogger:
+            byte_count = out_path.stat().st_size if out_path.exists() else 0
+            alogger.record_contextual(
+                operation="file_write_complete",
+                source=str(out_path),
+                response_summary=f"Report written ({byte_count} bytes)",
+                byte_count=byte_count,
+            )
+
         return out_path
 
     # ── Convenience: write both outputs ───────────────────────────────────

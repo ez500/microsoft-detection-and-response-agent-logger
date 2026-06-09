@@ -17,6 +17,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+import agent_trace
 from config import Config
 from narrator import LLMNarrator
 from scanner import ArtifactScanner
@@ -100,6 +101,22 @@ def main(argv: Optional[list] = None) -> int:
 
     target_date = resolve_date(args)
 
+    # ── Initialize AgentTrace ─────────────────────────────────────────────
+    agent_trace.init(
+        agent_name=config.trace_agent_name,
+        log_dir=config.trace_log_dir,
+        enable_otel=config.enable_otel and not args.dry_run,
+        otel_endpoint=config.otel_endpoint if config.enable_otel else None,
+        verbose=config.verbose,
+    )
+
+    # Instrument the pipeline classes (decorators already applied, just ensure logging)
+    from agent_trace import get_logger
+    _trace_logger = get_logger()
+    if _trace_logger and config.verbose:
+        print(f"   AgentTrace: enabled (jsonl={config.trace_log_dir}/traces.jsonl"
+              f"{', otel=' + config.otel_endpoint if config.enable_otel else ''})")
+
     print(f"🔍 MXDR Audit Logger — {target_date}")
     print(f"   Agent root: {config.agent_root}")
     print(f"   Dry run:    {args.dry_run}")
@@ -165,11 +182,20 @@ def main(argv: Optional[list] = None) -> int:
     result["duration_seconds"] = round(elapsed, 1)
 
     print()
+    # ── Shutdown AgentTrace ──────────────────────────────────────────────
+    trace_event_count = 0
+    if _trace_logger:
+        trace_event_count = _trace_logger.events_written
+    agent_trace.shutdown()
+
     print(f"✅ Audit logging complete for {target_date}")
     print(f"   Events logged:  {result['event_count']}")
+    print(f"   Trace events:   {trace_event_count}")
     print(f"   Duration:       {result['duration_seconds']}s")
     print(f"   JSONL log:      {result['jsonl']}")
     print(f"   Markdown report:{result['report']}")
+    if trace_event_count > 0:
+        print(f"   Trace log:      {config.trace_log_dir / 'traces.jsonl'}")
     print()
 
     return 0

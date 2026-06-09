@@ -25,16 +25,35 @@ MXDR_analysis_agent (existing, unmodified)
     ├── rules/watchlist.yaml                       │       │
     ├── data/daily_stats.jsonl                    ─┘       │
     └── ...other artifacts...                              │
-                                                          ▼
-                                                   List[AuditEvent]
-                                                          │
-                                                          ▼
-                                                   LLMNarrator (Gemini)
-                                                          │
-                                                    ┌─────┴─────┐
-                                                    ▼           ▼
-                                              JSONL Log    Markdown Report
-                                          (audit_logs/)  (audit_reports/)
+                                                           ▼
+                                                    List[AuditEvent]
+                                                           │
+                                                           ▼
+                                                    LLMNarrator (Gemini)
+                                                           │
+                                                     ┌─────┴─────┐
+                                                     ▼           ▼
+                                               JSONL Log    Markdown Report
+                                           (audit_logs/)  (audit_reports/)
+
+                            ┌─────────────────────────────────────────┐
+                            │          AgentTrace Framework           │
+                            │  (Runtime Instrumentation & Tracing)    │
+                            │                                         │
+                            │  ┌─────────────────────────────────┐    │
+                            │  │   TraceSchema (Unified Envelope) │    │
+                            │  │   ├── Operational Surface       │    │
+                            │  │   ├── Cognitive Surface         │    │
+                            │  │   └── Contextual Surface        │    │
+                            │  └─────────────────────────────────┘    │
+                            │                                         │
+                            │  ┌────────────┐  ┌──────────────────┐   │
+                            │  │  ALogger   │  │  OTel Exporter   │   │
+                            │  │  (JSONL)   │  │  (OTLP/gRPC)     │   │
+                            │  └────────────┘  └──────────────────┘   │
+                            │                                         │
+                            │  trace_logs/traces.jsonl (dual-path)    │
+                            └─────────────────────────────────────────┘
 ```
 
 ## Installation
@@ -150,6 +169,73 @@ matched IP address 203.0.113.45 with 7 distinct user accounts...
 ## Statistics Dashboard
 - Total alerts: 1,056 | Non-noisy alerts: 48
 - Suspicious clusters: 6 | P1 items: 2
+```
+
+## AgentTrace Integration
+
+The system includes [AgentTrace](https://arxiv.org/pdf/2602.10133v1), a structured logging framework for agent system observability that provides runtime instrumentation across three surfaces.
+
+### Three-Surface Taxonomy
+
+| Surface | What It Captures | Example |
+|---|---|---|
+| **Operational** | Method calls, arguments, return values, timing | `scan_all()` start/complete events with duration |
+| **Cognitive** | LLM interactions — prompts, completions, thinking segments | Gemini prompt/response pairs with token counts |
+| **Contextual** | External I/O — file reads/writes, API calls | JSONL write operations, narrative report output |
+
+### How AgentTrace Works
+
+AgentTrace instruments the existing `ArtifactScanner`, `LLMNator`, and `AuditLogWriter` classes at runtime using Python decorators — **no modifications to agent code are required**:
+
+1. `@instrument(agent_name="ClassName")` decorator wraps each public method
+2. Each method call emits **start** and **complete/error** operational events with trace/span IDs
+3. LLM responses are scanned for cognitive segments: `<thinking>` tags, `<plan>` tags, JSON fields, Chain-of-Thought reasoning
+4. File I/O operations are automatically captured as contextual events
+5. All events flow to both JSONL (local) and OTel (remote) backends simultaneously
+
+### Enabling AgentTrace
+
+```python
+# In main.py (already integrated)
+import agent_trace
+agent_trace.init(
+    agent_name="MXDR_agent",
+    log_dir=Path("trace_logs"),
+    enable_otel=True,                    # Enable OTel export
+    otel_endpoint="http://localhost:4317", # Jaeger/Tempo endpoint
+)
+```
+
+Or via environment variables:
+```env
+ENABLE_OTEL=true
+OTEL_ENDPOINT=http://localhost:4317
+```
+
+### OpenTelemetry Integration
+
+When enabled, AgentTrace exports trace events as OTel spans to any compatible backend (Jaeger, Tempo, Grafana):
+
+```bash
+# Start with OTel export
+python main.py --date 2026-03-25
+
+# Traces will be available at http://localhost:16686 (Jaeger UI)
+```
+
+### Trace Log Output
+
+All trace events are written to `trace_logs/traces.jsonl`:
+```json
+{
+  "event_id": "a1b2c3d4e5f6",
+  "surface": "operational",
+  "trace_id": "abc123...",
+  "span_id": "def456...",
+  "agent_name": "MXDR_agent",
+  "body": {"method": "scan_all", "status": "complete", "duration_ms": 1250.3},
+  "timestamp": "2026-03-25T12:00:00.000Z"
+}
 ```
 
 ## Integration with MXDR Analysis Agent

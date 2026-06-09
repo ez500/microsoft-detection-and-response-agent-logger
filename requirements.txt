@@ -4,3 +4,9 @@
 google-generativeai>=0.8.0
 python-dotenv>=1.0.0
 pyyaml>=6.0
+
+# ── AgentTrace / OpenTelemetry (optional) ──────────────────────────────
+# Install with: pip install -r requirements-otel.txt
+# opentelemetry-api>=1.28.0
+# opentelemetry-sdk>=1.28.0
+# opentelemetry-exporter-otlp-proto-grpc>=1.28.0

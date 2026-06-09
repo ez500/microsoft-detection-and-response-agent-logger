@@ -31,6 +31,12 @@ class Config:
     report_dir: Path = Path("audit_reports")
     snapshot_dir: Path = Path("snapshots")
 
+    # ── AgentTrace / Telemetry ────────────────────────────────────────────
+    enable_otel: bool = False
+    otel_endpoint: str = "http://localhost:4317"
+    trace_log_dir: Path = Path("trace_logs")
+    trace_agent_name: str = "MXDR_agent"
+
     # ── Verbosity ──────────────────────────────────────────────────────────
     verbose: bool = False
 
@@ -67,6 +73,8 @@ class Config:
             gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
             llm_model=os.getenv("LLM_MODEL", "gemini-2.0-flash"),
             agent_root=Path(agent_root_str),
+            enable_otel=os.getenv("ENABLE_OTEL", "").lower() in ("1", "true", "yes"),
+            otel_endpoint=os.getenv("OTEL_ENDPOINT", "http://localhost:4317"),
             verbose=os.getenv("VERBOSE", "").lower() in ("1", "true", "yes"),
         )
 
@@ -75,3 +83,4 @@ class Config:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.report_dir.mkdir(parents=True, exist_ok=True)
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+        self.trace_log_dir.mkdir(parents=True, exist_ok=True)

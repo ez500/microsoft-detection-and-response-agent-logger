@@ -7,6 +7,7 @@ narrative report, correlation rules, etc.) has its own scanning logic.
 """
 
 import json
+import logging
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -14,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
+from agent_trace import get_logger, instrument
 from config import Config
 from events import (
     AuditEvent,
@@ -39,7 +41,10 @@ from events import (
     make_pipeline_complete_event,
 )
 
+logger = logging.getLogger(__name__)
 
+
+@instrument(agent_name="ArtifactScanner")
 class ArtifactScanner:
     """
     Scans MXDR analysis agent output artifacts for a given date and produces
@@ -80,6 +85,17 @@ class ArtifactScanner:
 
         # Sort by timestamp
         self.events.sort(key=lambda e: e.timestamp)
+
+        # Record contextual span for scan completion
+        alogger = get_logger()
+        if alogger:
+            alogger.record_contextual(
+                operation="scan_complete",
+                source=f"ArtifactScanner/{self.target_date}",
+                response_summary=f"{len(self.events)} events scanned",
+                byte_count=0,
+            )
+
         return self.events
 
     # ── Analysis packet ──────────────────────────────────────────────────
