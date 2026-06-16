@@ -15,53 +15,53 @@ from uuid import uuid4
 class EventType(str, Enum):
     """Every event category that the logging system can detect."""
 
-    # ── Ingestion ──────────────────────────────────────────────────────
+    # Ingestion
     ALERTS_INGESTED = "ALERTS_INGESTED"
 
-    # ── Pre-Analysis ───────────────────────────────────────────────────
+    # Pre-Analysis
     ANALYSIS_PACKET_GENERATED = "ANALYSIS_PACKET_GENERATED"
 
-    # ── Correlation Rules ──────────────────────────────────────────────
+    # Correlation Rules
     RULE_TRIGGERED = "RULE_TRIGGERED"
     RULE_NOT_TRIGGERED = "RULE_NOT_TRIGGERED"
 
-    # ── Watchlist ──────────────────────────────────────────────────────
+    # Watchlist
     WATCHLIST_HIT = "WATCHLIST_HIT"
 
-    # ── Clustering ─────────────────────────────────────────────────────
+    # Clustering
     CLUSTERS_GENERATED = "CLUSTERS_GENERATED"
 
-    # ── Prioritization ─────────────────────────────────────────────────
+    # Prioritization
     SOC_QUEUE_GENERATED = "SOC_QUEUE_GENERATED"
 
-    # ── Reporting ──────────────────────────────────────────────────────
+    # Reporting
     NARRATIVE_REPORT_WRITTEN = "NARRATIVE_REPORT_WRITTEN"
 
-    # ── Rule Updates ───────────────────────────────────────────────────
+    # Rule Updates
     RULE_CONFIDENCE_UPDATED = "RULE_CONFIDENCE_UPDATED"
     RULE_RETIRED = "RULE_RETIRED"
 
-    # ── Watchlist Updates ──────────────────────────────────────────────
+    # Watchlist Updates
     WATCHLIST_UPDATED = "WATCHLIST_UPDATED"
 
-    # ── False Negatives ────────────────────────────────────────────────
+    # False Negatives
     FALSE_NEGATIVE_RECORDED = "FALSE_NEGATIVE_RECORDED"
 
-    # ── Statistics ─────────────────────────────────────────────────────
+    # Statistics
     DAILY_STATS_APPENDED = "DAILY_STATS_APPENDED"
 
-    # ── Anomaly Detection ──────────────────────────────────────────────
+    # Anomaly Detection
     NEW_ALERT_TITLE_DETECTED = "NEW_ALERT_TITLE_DETECTED"
     VOLUME_SPIKE_DETECTED = "VOLUME_SPIKE_DETECTED"
 
-    # ── Entity Insights ────────────────────────────────────────────────
+    # Entity Insights
     HIGH_RISK_ENTITY_OBSERVED = "HIGH_RISK_ENTITY_OBSERVED"
 
-    # ── Pipeline Metadata ──────────────────────────────────────────────
+    # Pipeline Metadata
     PIPELINE_RUN_STARTED = "PIPELINE_RUN_STARTED"
     PIPELINE_RUN_COMPLETED = "PIPELINE_RUN_COMPLETED"
 
-    # ── AgentTrace Trace Surfaces ──────────────────────────────────────
+    # AgentTrace Trace Surfaces
     TRACE_OPERATIONAL_START = "TRACE_OPERATIONAL_START"
     TRACE_OPERATIONAL_COMPLETE = "TRACE_OPERATIONAL_COMPLETE"
     TRACE_OPERATIONAL_ERROR = "TRACE_OPERATIONAL_ERROR"
@@ -85,7 +85,7 @@ class AuditEvent:
     """
 
     event_id: str = field(default_factory=lambda: uuid4().hex[:12])
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat() + "Z")
     event_type: EventType = EventType.PIPELINE_RUN_STARTED
     severity: Severity = Severity.INFO
     source_file: str = ""
@@ -125,7 +125,7 @@ class AuditEvent:
         )
 
 
-# ── Convenience factory functions ─────────────────────────────────────────────
+# Convenience factory functions───────
 
 def make_alert_ingestion_event(
     total: int, high: int, medium: int, low: int, info: int,

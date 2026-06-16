@@ -123,7 +123,7 @@ class TraceEvent:
         return self.level == TraceLevel.ERROR or self.error is not None
 
 
-# ── Operational surface body builders ────────────────────────────────────────
+# Operational surface body builders
 
 
 def make_operational_body(
@@ -149,7 +149,7 @@ def make_operational_body(
     return body
 
 
-# ── Cognitive surface body builders ──────────────────────────────────────────
+# Cognitive surface body builders
 
 
 def make_cognitive_body(
@@ -191,9 +191,7 @@ def make_cognitive_body(
     return body
 
 
-# ── Contextual surface body builders ─────────────────────────────────────────
-
-
+# Contextual surface body builders
 def make_contextual_body(
     operation: str,
     source: str,

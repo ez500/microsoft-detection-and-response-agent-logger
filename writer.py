@@ -33,7 +33,7 @@ class AuditLogWriter:
         self.config = config
         config.ensure_output_dirs()
 
-    # ── JSONL output ──────────────────────────────────────────────────────
+    # JSONL output
 
     def write_jsonl(self, events: List[AuditEvent], date_str: str) -> Path:
         """
@@ -70,7 +70,7 @@ class AuditLogWriter:
 
         return out_path
 
-    # ── Markdown report output ────────────────────────────────────────────
+    # Markdown report output
 
     def write_report(
         self,
@@ -112,7 +112,7 @@ class AuditLogWriter:
 
         return out_path
 
-    # ── Convenience: write both outputs ───────────────────────────────────
+    # Convenience: write both outputs
 
     def write_all(
         self,
@@ -142,7 +142,7 @@ class AuditLogWriter:
         # Compute duration if start_time provided
         duration = 0.0
         if start_time:
-            duration = (datetime.utcnow() - start_time).total_seconds()
+            duration = (datetime.now() - start_time).total_seconds()
 
         # Create and write the completion event
         complete_event = make_pipeline_complete_event(

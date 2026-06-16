@@ -13,13 +13,13 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional, cast, Callable
 
 from trace_schema import TraceEvent, TraceSurface, SpanKind
 
 logger = logging.getLogger(__name__)
 
-# ── Lazy OTel imports (optional dependency) ──────────────────────────────────
+# Lazy OTel imports (optional dependency)
 
 _OTEL_AVAILABLE = False
 try:
@@ -34,6 +34,7 @@ try:
     _OTEL_AVAILABLE = True
 except ImportError:
     otel_trace = None  # type: ignore
+    Resource = None  # type: ignore
     TracerProvider = None  # type: ignore
     BatchSpanProcessor = None  # type: ignore
     SimpleSpanProcessor = None  # type: ignore
@@ -43,9 +44,7 @@ except ImportError:
     StatusCode = None  # type: ignore
 
 
-# ── Surface → OTel span name mapping ────────────────────────────────────────
-
-
+# Surface → OTel span name mapping
 def _span_name_from_event(event: TraceEvent) -> str:
     """Derive a human-readable span name from a trace event."""
     if event.surface == TraceSurface.OPERATIONAL:
@@ -61,9 +60,7 @@ def _span_name_from_event(event: TraceEvent) -> str:
     return f"{event.agent_name}.event"
 
 
-# ── Surface → OTel SpanKind mapping ─────────────────────────────────────────
-
-
+# Surface → OTel SpanKind mapping
 def _otel_span_kind(kind: SpanKind):
     """Map AgentTrace SpanKind to OTel SpanKind."""
     if OTelSpanKind is None:
@@ -78,9 +75,7 @@ def _otel_span_kind(kind: SpanKind):
     return mapping.get(kind, OTelSpanKind.INTERNAL)
 
 
-# ── Defensive attribute serialization ────────────────────────────────────────
-
-
+# Defensive attribute serialization
 def _safe_set_attribute(span, key: str, value: Any):
     """Set a span attribute with defensive type checking."""
     if value is None:
@@ -93,9 +88,7 @@ def _safe_set_attribute(span, key: str, value: Any):
         span.set_attribute(key, str(value))
 
 
-# ── OTel Span Exporter ──────────────────────────────────────────────────────
-
-
+# OTel Span Exporter
 class OTelExporter:
     """
     Converts AgentTrace TraceEvents to OpenTelemetry spans and exports them.
@@ -121,6 +114,8 @@ class OTelExporter:
             return
 
         try:
+            if not Resource:
+                return
             resource = Resource.create({"service.name": service_name})
             provider_class = TracerProvider
             if provider_class is None:
@@ -129,7 +124,8 @@ class OTelExporter:
 
             # Configure exporter
             if endpoint and OTLPSpanExporter is not None:
-                span_exporter = OTLPSpanExporter(endpoint=endpoint)
+                ExporterClass = cast(Callable[..., Any], cast(object, OTLPSpanExporter))
+                span_exporter = ExporterClass(endpoint=endpoint)
             else:
                 # Use a console exporter as fallback (for development)
                 from opentelemetry.sdk.trace.export import ConsoleSpanExporter
@@ -144,6 +140,8 @@ class OTelExporter:
             if self._processor is not None:
                 self._provider.add_span_processor(self._processor)
 
+            if not otel_trace:
+                return
             otel_trace.set_tracer_provider(self._provider)
 
             tracer_provider = otel_trace.get_tracer_provider() if otel_trace else None
@@ -173,6 +171,9 @@ class OTelExporter:
         try:
             span_name = _span_name_from_event(event)
             otel_kind = _otel_span_kind(event.span_kind)
+
+            if not otel_kind:
+                return False
 
             # Start a new span
             span = self._tracer.start_span(

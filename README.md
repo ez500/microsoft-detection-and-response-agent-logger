@@ -1,12 +1,12 @@
 # MXDR Logging System
 
-An **LLM-based audit logging system** that observes, parses, and processes every action and insight from the [MXDR analysis agent](https://github.com/eugen-moniree/MXDR_analysis_agent) pipeline. It produces maximally verbose, human-readable audit logs enhanced by Google Gemini LLM interpretation.
+An **LLM-based audit logging system** that observes, parses, and processes every action and insight from the [MXDR analysis agent](https://github.com/eugen-moniree/MXDR_analysis_agent) pipeline. It produces maximally verbose, human-readable audit logs enhanced by various LLM API interpretation.
 
 ## Features
 
 - **Automated artifact scanning** — reads all analysis agent output artifacts (analysis packets, narrative reports, correlation rules, watchlists, false negatives, daily stats)
 - **17+ event types** — ingestion, correlation rule hits, watchlist alerts, clustering, SOC queue prioritization, anomaly detection, volume spikes, rule confidence changes, and more
-- **LLM-enhanced narration** — Google Gemini transforms structured events into verbose, plain-English audit narratives
+- **LLM-enhanced narration** — An LLM transforms structured events into verbose, plain-English audit narratives
 - **Graceful fallback** — template-based narratives when the API is unavailable
 - **Dual output formats**:
   - `audit_logs/YYYY-MM-DD.jsonl` — machine-parseable structured JSONL log
@@ -29,7 +29,7 @@ MXDR_analysis_agent (existing, unmodified)
                                                     List[AuditEvent]
                                                            │
                                                            ▼
-                                                    LLMNarrator (Gemini)
+                                                     LLMNarrator (LLM)
                                                            │
                                                      ┌─────┴─────┐
                                                      ▼           ▼
@@ -66,15 +66,15 @@ cd MXDR_logging
 pip install -r requirements.txt
 
 # 3. Configure your environment
-#    Edit .env and set your Gemini API key (free at https://aistudio.google.com)
-#    GEMINI_API_KEY=your-api-key-here
+#    Edit .env and set your LLM API key
+#    CLAUDE_API_KEY=your-api-key-here    # or GEMINI_API_KEY=
 #    MXDR_AGENT_ROOT=C:\Users\eugen\Projects\MXDR_analysis_agent
 ```
 
 ## Usage
 
 ```bash
-# Process a specific date (requires GEMINI_API_KEY in .env)
+# Process a specific date (requires LLM API key in .env)
 python main.py --date 2026-03-25
 
 # Process yesterday (for cron/automation)
@@ -128,7 +128,7 @@ MXDR_logging/
 ├── config.py                  # Configuration management
 ├── events.py                  # Event taxonomy (17+ event types)
 ├── scanner.py                 # ArtifactScanner
-├── narrator.py                # LLMNarrator (Gemini + fallback)
+├── narrator.py                # LLMNarrator (LLM + fallback)
 ├── writer.py                  # AuditLogWriter
 ├── .env                       # Environment configuration
 ├── requirements.txt           # Python dependencies
@@ -180,7 +180,7 @@ The system includes [AgentTrace](https://arxiv.org/pdf/2602.10133v1), a structur
 | Surface | What It Captures | Example |
 |---|---|---|
 | **Operational** | Method calls, arguments, return values, timing | `scan_all()` start/complete events with duration |
-| **Cognitive** | LLM interactions — prompts, completions, thinking segments | Gemini prompt/response pairs with token counts |
+| **Cognitive** | LLM interactions — prompts, completions, thinking segments | LLM prompt/response pairs with token counts |
 | **Contextual** | External I/O — file reads/writes, API calls | JSONL write operations, narrative report output |
 
 ### How AgentTrace Works
@@ -240,10 +240,10 @@ All trace events are written to `trace_logs/traces.jsonl`:
 
 ## Integration with MXDR Analysis Agent
 
-For automated daily use, add this step to `run_daily_analysis.sh` after the Claude analysis completes:
+For automated daily use, add this step to `run_daily_analysis.sh` after the analysis agent completes:
 
 ```bash
-# After step 3 (Claude analysis)
+# After step 3 (analysis agent completes)
 echo "[4/4] Generating audit log..."
 cd /path/to/MXDR_logging
 python main.py --yesterday --agent-root /path/to/MXDR_analysis_agent

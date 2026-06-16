@@ -22,16 +22,15 @@ from __future__ import annotations
 import functools
 import json
 import logging
-import os
 import re
 import time
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, TypeVar
 
+from otel_exporter import OTelExporter
 from trace_schema import (
     SpanKind,
     TraceEvent,
@@ -41,11 +40,10 @@ from trace_schema import (
     make_contextual_body,
     make_operational_body,
 )
-from otel_exporter import OTelExporter
 
 logger = logging.getLogger(__name__)
 
-# ── Context propagation (thread-safe) ────────────────────────────────────────
+# Context propagation (thread-safe)
 
 _current_trace_id: ContextVar[str] = ContextVar("_current_trace_id", default="")
 _current_span_id: ContextVar[str] = ContextVar("_current_span_id", default="")
@@ -54,7 +52,7 @@ _current_agent_name: ContextVar[str] = ContextVar("_current_agent_name", default
 F = TypeVar("F", bound=Callable[..., Any])
 
 
-# ── Trace context helpers ────────────────────────────────────────────────────
+# Trace context helpers
 
 
 class TraceContext:
@@ -111,7 +109,7 @@ class TraceContext:
             _current_span_id.set(parent_span)
 
 
-# ── ALogger: Central Logging Interface ──────────────────────────────────────
+# ALogger: Central Logging Interface
 
 
 class ALogger:
@@ -139,7 +137,7 @@ class ALogger:
             # Use a combined trace log for all surfaces
             self._jsonl_path = log_dir / "traces.jsonl"
 
-    # ── Recording methods ────────────────────────────────────────────────
+    # Recording methods──────────
 
     def record_operational(
         self,
@@ -326,7 +324,7 @@ class ALogger:
         self._write_event(event)
         return event
 
-    # ── Internal write logic ─────────────────────────────────────────────
+    # Internal write logic───────
 
     def _write_event(self, event: TraceEvent):
         """Write a trace event to JSONL and optionally export to OTel."""
@@ -352,7 +350,7 @@ class ALogger:
         return self._events_written
 
 
-# ── Global logger instance ───────────────────────────────────────────────────
+# Global logger instance─────────────
 
 _logger_instance: Optional[ALogger] = None
 
@@ -362,7 +360,7 @@ def get_logger() -> Optional[ALogger]:
     return _logger_instance
 
 
-# ── Init ─────────────────────────────────────────────────────────────────────
+# Init───────────────────────────────
 
 
 def init(
@@ -435,7 +433,7 @@ def shutdown():
     TraceContext.reset()
 
 
-# ── Instrumentation decorator ────────────────────────────────────────────────
+# Instrumentation decorator──────────
 
 
 def instrument(
@@ -595,7 +593,7 @@ def _make_wrapper(
     return wrapper
 
 
-# ── Cognitive extraction ─────────────────────────────────────────────────────
+# Cognitive extraction───────────────
 
 
 def _maybe_extract_cognitive(
@@ -608,10 +606,10 @@ def _maybe_extract_cognitive(
     Attempt to extract cognitive segments from a function result.
 
     Supports:
-    - Objects with a `.text` attribute (Gemini responses)
+    - Objects with a `.text` attribute (LLM responses)
     - Strings containing <thinking>...</thinking> tags
     - Dicts with 'plan', 'reflection', 'thought' keys
-    - Objects with a `candidates` attribute (Google AI SDK)
+    - Objects with a `candidates` attribute (LLM SDK response)
 
     Returns True if cognitive data was extracted and logged.
     """
@@ -640,7 +638,7 @@ def _maybe_extract_cognitive(
                 )
         return True
     elif hasattr(result, "candidates"):
-        # Google AI SDK response
+        # LLM SDK response (e.g., Google Generative AI)
         try:
             for candidate in result.candidates:
                 if hasattr(candidate, "content") and hasattr(candidate.content, "parts"):
@@ -756,7 +754,7 @@ def _extract_cot_steps(text: str) -> Optional[str]:
     return None
 
 
-# ── Value summarization helpers ──────────────────────────────────────────────
+# Value summarization helpers
 
 
 def _summarize_args(args: tuple, kwargs: dict) -> str:

@@ -17,30 +17,33 @@ from dotenv import load_dotenv
 class Config:
     """Central configuration for the MXDR logging system."""
 
-    # ── LLM settings ──────────────────────────────────────────────────────
+    # LLM settings
     gemini_api_key: str = ""
-    llm_model: str = "gemini-2.0-flash"
+    gemini_model: str = "gemini-2.0-flash"
+
+    claude_api_key: str = ""
+    claude_model: str = "claude-haiku-4-5-20251001"
     llm_temperature: float = 0.7
     llm_max_output_tokens: int = 8192
 
-    # ── Agent root path ────────────────────────────────────────────────────
+    # Agent root path
     agent_root: Path = Path.home() / "Projects" / "MXDR_analysis_agent"
 
-    # ── Log output paths (relative to MXDR_logging/) ──────────────────────
+    # Log output paths (relative to MXDR_logging/)
     log_dir: Path = Path("audit_logs")
     report_dir: Path = Path("audit_reports")
     snapshot_dir: Path = Path("snapshots")
 
-    # ── AgentTrace / Telemetry ────────────────────────────────────────────
+    # AgentTrace / Telemetry
     enable_otel: bool = False
     otel_endpoint: str = "http://localhost:4317"
     trace_log_dir: Path = Path("trace_logs")
     trace_agent_name: str = "MXDR_agent"
 
-    # ── Verbosity ──────────────────────────────────────────────────────────
+    # Verbosity
     verbose: bool = False
 
-    # ── Derived artifact paths (computed) ──────────────────────────────────
+    # Derived artifact paths (computed)
     _artifact_paths: dict = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
@@ -71,7 +74,9 @@ class Config:
 
         return cls(
             gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
-            llm_model=os.getenv("LLM_MODEL", "gemini-2.0-flash"),
+            gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+            claude_api_key=os.getenv("CLAUDE_API_KEY", ""),
+            claude_model=os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001"),
             agent_root=Path(agent_root_str),
             enable_otel=os.getenv("ENABLE_OTEL", "").lower() in ("1", "true", "yes"),
             otel_endpoint=os.getenv("OTEL_ENDPOINT", "http://localhost:4317"),

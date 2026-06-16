@@ -1,9 +1,9 @@
 """
 narrator.py — LLMNarrator for the MXDR logging system.
 
-Uses Google Gemini to transform structured audit events into verbose,
-human-readable narrative audit reports. Falls back to template-based
-narration if the API is unavailable.
+Uses an LLM (Claude or Gemini) to transform structured audit events into
+verbose, human-readable narrative audit reports. Falls back to
+template-based narration if the API is unavailable.
 """
 
 import json
@@ -25,41 +25,73 @@ class LLMNarrator:
     Enhances structured audit events with LLM-generated verbose narratives
     and produces a full Markdown audit report.
 
-    Uses Google Gemini (gemini-2.0-flash) when the API key is available.
+    Supports multiple LLM backends (Claude, Gemini, etc.).
     Falls back to template-based narration if the API cannot be reached.
     """
 
     def __init__(self, config: Config):
         self.config = config
         self._model = None
+        self._llm_provider: Optional[str] = None  # "gemini" | "claude" | None
 
-        # Initialize Gemini if API key is configured
-        self._init_gemini()
+        # Initialize whichever LLM is configured
+        self._init_llm()
 
-    def _init_gemini(self):
-        """Initialize the Gemini model if an API key is configured."""
-        api_key = self.config.gemini_api_key
-        if api_key:
+    def _init_llm(self):
+        """Initialize the LLM model — prefers Claude if both keys are set."""
+        claude_api_key = self.config.claude_api_key
+        gemini_api_key = self.config.gemini_api_key
+
+        # Prefer Claude if its key is present
+        if claude_api_key:
+            try:
+                import anthropic
+                self._model = anthropic.Anthropic(api_key=claude_api_key)
+                self._llm_provider = "claude"
+                print(f"[narrator] Claude initialized (model: {self.config.claude_model})")
+                return
+            except Exception as e:
+                print(f"[narrator] WARNING: Failed to initialize Claude: {e}")
+                self._model = None
+                self._llm_provider = None
+
+        # Fall back to Gemini
+        if gemini_api_key:
             try:
                 import google.generativeai as genai
-                genai.configure(api_key=api_key)
+                from google.generativeai import GenerationConfig
+
+                genai.configure(api_key=gemini_api_key)
+
                 self._model = genai.GenerativeModel(
-                    model_name=self.config.llm_model,
-                    generation_config={
-                        "temperature": self.config.llm_temperature,
-                        "max_output_tokens": self.config.llm_max_output_tokens,
-                    },
+                    model_name=self.config.gemini_model,
+                    generation_config=GenerationConfig(
+                        temperature=self.config.llm_temperature,
+                        max_output_tokens=self.config.llm_max_output_tokens,
+                    ),
                 )
+                self._llm_provider = "gemini"
+                print(f"[narrator] Gemini initialized (model: {self.config.gemini_model})")
             except Exception as e:
                 print(f"[narrator] WARNING: Failed to initialize Gemini: {e}")
                 self._model = None
+                self._llm_provider = None
 
     @property
     def available(self) -> bool:
         """Check if the LLM is available for narration."""
         return self._model is not None
 
-    # ── Public API ────────────────────────────────────────────────────────
+    @property
+    def active_model_name(self) -> str:
+        """Return the name of the model currently in use."""
+        if self._llm_provider == "claude":
+            return self.config.claude_model
+        elif self._llm_provider == "gemini":
+            return self.config.gemini_model
+        return "template-fallback"
+
+    # Public API
 
     def narrate_events(self, events: List[AuditEvent]) -> List[AuditEvent]:
         """
@@ -76,7 +108,7 @@ class LLMNarrator:
 
         # Fallback: template-based narration
         for event in events:
-            event.llm_narrative = self._template_narrative(event)
+            event.llm_narrative = self.template_narrative(event)
         return events
 
     def generate_report(self, events: List[AuditEvent], date_str: str) -> str:
@@ -94,24 +126,13 @@ class LLMNarrator:
 
         return self._template_report(events, date_str)
 
-    # ── LLM narration ─────────────────────────────────────────────────────
-
-    def _llm_narrate(self, events: List[AuditEvent]) -> List[AuditEvent]:
-        """Use Gemini to generate verbose narratives for each event."""
-        # Record cognitive event for LLM call
-        alogger = get_logger()
-        if alogger:
-            alogger.record_cognitive(
-                model=self.config.llm_model,
-                prompt_summary=f"Narrating {len(events)} events",
-                completion_summary="pending",
-                temperature=self.config.llm_temperature,
-            )
-
-        # Build a prompt with all events
-        event_descriptions = []
+    # LLM narration
+    @staticmethod
+    def _build_event_descriptions(events: List[AuditEvent]) -> List[str]:
+        """Build a list of event description strings for the prompt."""
+        descriptions = []
         for i, event in enumerate(events):
-            event_descriptions.append(
+            descriptions.append(
                 f"[EVENT {i}]\n"
                 f"Type: {event.event_type.value}\n"
                 f"Severity: {event.severity.value}\n"
@@ -120,8 +141,13 @@ class LLMNarrator:
                 f"Details: {json.dumps(event.details, indent=2)}\n"
                 f"Raw: {event.raw_snippet}\n"
             )
+        return descriptions
 
-        prompt = textwrap.dedent(f"""\
+    def _build_narration_prompt(self, events: List[AuditEvent]) -> str:
+        """Build the event narration prompt shared across providers."""
+        event_descriptions = self._build_event_descriptions(events)
+
+        return textwrap.dedent(f"""\
         You are an expert MXDR (Microsoft Extended Detection and Response) audit analyst.
         Your job is to produce verbose, plain-English narratives for security audit events.
 
@@ -143,19 +169,50 @@ class LLMNarrator:
         Each line should be prefixed with "NARRATIVE_i:" where i is the event index.
         """)
 
-        response = self._model.generate_content(prompt)
-        text = response.text
+    @staticmethod
+    def _parse_narratives(text: str) -> Dict[int, str]:
+        """Parse NARRATIVE_i: lines from the LLM response text."""
+        narratives: Dict[int, str] = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("NARRATIVE_"):
+                try:
+                    prefix, rest = line.split(":", 1)
+                    idx = int(prefix.replace("NARRATIVE_", ""))
+                    narratives[idx] = rest.strip()
+                except (ValueError, IndexError):
+                    continue
+        return narratives
+
+    def _llm_narrate(self, events: List[AuditEvent]) -> List[AuditEvent]:
+        """Use the active LLM to generate verbose narratives for each event."""
+        # Record cognitive event for LLM call
+        alogger = get_logger()
+        if alogger:
+            alogger.record_cognitive(
+                model=self.active_model_name,
+                prompt_summary=f"Narrating {len(events)} events",
+                completion_summary="pending",
+                temperature=self.config.llm_temperature,
+            )
+
+        prompt = self._build_narration_prompt(events)
+
+        # Dispatch by provider
+        if self._llm_provider == "claude":
+            text = self._claude_complete(prompt)
+        else:
+            text = self._gemini_complete(prompt)
 
         # Record cognitive event for LLM completion with cognitive extraction
         if alogger:
-            # Extract thinking segments from the response
             thought_segments = []
             import re
             thinking_matches = re.findall(r"<thinking>(.*?)</thinking>", text, re.DOTALL)
             for segment in thinking_matches:
                 thought_segments.append(segment.strip())
             alogger.record_cognitive(
-                model=self.config.llm_model,
+                model=self.active_model_name,
                 thought="\n".join(thought_segments) if thought_segments else None,
                 completion_summary=text[:200],
                 total_tokens=len(text.split()),
@@ -163,34 +220,24 @@ class LLMNarrator:
             )
 
         # Parse the response
-        narratives: Dict[int, str] = {}
-        for line in text.splitlines():
-            line = line.strip()
-            if line.startswith("NARRATIVE_"):
-                # Parse "NARRATIVE_0: text"
-                try:
-                    prefix, rest = line.split(":", 1)
-                    idx = int(prefix.replace("NARRATIVE_", ""))
-                    narratives[idx] = rest.strip()
-                except (ValueError, IndexError):
-                    continue
+        narratives = self._parse_narratives(text)
 
         # Apply narratives to events
         for i, event in enumerate(events):
             if i in narratives:
                 event.llm_narrative = narratives[i]
             else:
-                event.llm_narrative = self._template_narrative(event)
+                event.llm_narrative = self.template_narrative(event)
 
         return events
 
     def _llm_generate_report(self, events: List[AuditEvent], date_str: str) -> str:
-        """Use Gemini to generate a full Markdown audit report."""
+        """Use the active LLM to generate a full Markdown audit report."""
         # Record cognitive event for report generation
         alogger = get_logger()
         if alogger:
             alogger.record_cognitive(
-                model=self.config.llm_model,
+                model=self.active_model_name,
                 plan=f"Generate comprehensive audit report for {date_str}",
                 prompt_summary=f"Report generation with {len(events)} events",
                 temperature=self.config.llm_temperature,
@@ -240,31 +287,62 @@ class LLMNarrator:
         code blocks for metrics.
         """)
 
-        response = self._model.generate_content(prompt)
+        # Dispatch by provider
+        if self._llm_provider == "claude":
+            text = self._claude_complete(prompt)
+        else:
+            text = self._gemini_complete(prompt)
 
         # Record cognitive event for completion
         if alogger:
             alogger.record_cognitive(
-                model=self.config.llm_model,
-                completion_summary=f"Report generated: {len(response.text)} chars",
-                total_tokens=len(response.text.split()),
+                model=self.active_model_name,
+                completion_summary=f"Report generated: {len(text)} chars",
+                total_tokens=len(text.split()),
                 temperature=self.config.llm_temperature,
-                reflection="Report contains executive summary, timeline, correlation activity, entity intelligence, anomalies, and statistics",
+                reflection="Report contains executive summary, timeline, correlation activity, "
+                           "entity intelligence, anomalies, and statistics",
             )
 
+        return text
+
+    # Provider-specific API calls
+    def _gemini_complete(self, prompt: str) -> str:
+        """Send a prompt to Gemini and return the response text."""
+        response = self._model.generate_content(prompt)
         return response.text
 
-    # ── Template fallback ─────────────────────────────────────────────────
+    def _claude_complete(self, prompt: str) -> str:
+        """Send a prompt to Claude and return the response text."""
+        response = self._model.messages.create(
+            model=self.config.claude_model,
+            max_tokens=self.config.llm_max_output_tokens,
+            temperature=self.config.llm_temperature,
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+        )
+        # Extract text from the response content blocks
+        text_parts = []
+        for block in response.content:
+            if hasattr(block, 'text'):
+                text_parts.append(block.text)
+            elif isinstance(block, dict) and block.get('type') == 'text':
+                text_parts.append(block.get('text', ''))
+        return "\n".join(text_parts)
+
+    # Template fallback
 
     @staticmethod
-    def _template_narrative(event: AuditEvent) -> str:
+    def template_narrative(event: AuditEvent) -> str:
         """Generate a template-based narrative for a given event."""
         event_type = event.event_type.value if isinstance(event.event_type, EventType) else str(event.event_type)
         severity = event.severity.value if isinstance(event.severity, Severity) else str(event.severity)
 
         narratives = {
             EventType.ALERTS_INGESTED: (
-                f"The analysis pipeline successfully ingested {event.details.get('total', '?')} "
+                f"[{severity}] {event_type}: The analysis pipeline successfully ingested "
+                f"{event.details.get('total', '?')} "
                 f"security alerts from the Microsoft Graph Security API. "
                 f"Severity breakdown: {event.details.get('high', 0)} high, "
                 f"{event.details.get('medium', 0)} medium, "
@@ -273,8 +351,8 @@ class LLMNarrator:
                 f"These alerts span {event.details.get('incidents', '?')} distinct incidents."
             ),
             EventType.ANALYSIS_PACKET_GENERATED: (
-                f"The pre-analysis engine processed the ingested alerts and generated "
-                f"a structured analysis packet. "
+                f"[{severity}] {event_type}: The pre-analysis engine processed the ingested alerts "
+                f"and generated a structured analysis packet. "
                 f"Of the 8 correlation rules, "
                 f"{len(event.details.get('rules_triggered', {}))} triggered with hits, "
                 f"while {len(event.details.get('rules_not_triggered', []))} had no matches. "
@@ -283,20 +361,20 @@ class LLMNarrator:
                 f"were flagged for deeper analysis."
             ),
             EventType.RULE_TRIGGERED: (
-                f"Correlation rule {event.details.get('rule_id', '?')} triggered "
+                f"[{severity}] {event_type}: Correlation rule {event.details.get('rule_id', '?')} triggered "
                 f"{event.details.get('hit_count', 0)} time(s) during this analysis run. "
                 f"This rule detects specific patterns of suspicious activity "
                 f"and each hit represents a potential security concern requiring investigation. "
                 f"Confidence: {event.details.get('confidence', 'N/A')}."
             ),
             EventType.RULE_NOT_TRIGGERED: (
-                f"Correlation rule {event.details.get('rule_id', '?')} was evaluated "
+                f"[{severity}] {event_type}: Correlation rule {event.details.get('rule_id', '?')} was evaluated "
                 f"against the day's alerts but did not find any matching patterns. "
                 f"This is normal and expected — not every rule activates every day. "
                 f"Continued monitoring is required as threat actor behaviors change."
             ),
             EventType.WATCHLIST_HIT: (
-                f"A watchlisted entity was detected in active alerts: "
+                f"[{severity}] {event_type}: A watchlisted entity was detected in active alerts: "
                 f"{event.details.get('entity_type', '?')} = "
                 f"`{event.details.get('entity_value', '?')}`. "
                 f"Reason for watchlisting: {event.details.get('watchlist_reason', 'N/A')}. "
@@ -306,7 +384,7 @@ class LLMNarrator:
                 f"have been previously identified as suspicious."
             ),
             EventType.CLUSTERS_GENERATED: (
-                f"The clustering engine identified {event.details.get('cluster_count', 0)} "
+                f"[{severity}] {event_type}: The clustering engine identified {event.details.get('cluster_count', 0)} "
                 f"suspicious alert clusters from the day's analysis. "
                 f"Priority breakdown: {event.details.get('p1_count', 0)} P1 "
                 f"(investigate today), {event.details.get('p2_count', 0)} P2 "
@@ -315,7 +393,7 @@ class LLMNarrator:
                 f"coordinated attack campaigns rather than isolated events."
             ),
             EventType.SOC_QUEUE_GENERATED: (
-                f"The prioritization engine ranked {event.details.get('total_items', 0)} "
+                f"[{severity}] {event_type}: The prioritization engine ranked {event.details.get('total_items', 0)} "
                 f"SOC action items by urgency. "
                 f"Critical (P1): {event.details.get('p1_count', 0)}, "
                 f"High (P2): {event.details.get('p2_count', 0)}, "
@@ -324,7 +402,7 @@ class LLMNarrator:
                 f"{', '.join(event.details.get('top_items', []))[:200]}."
             ),
             EventType.NARRATIVE_REPORT_WRITTEN: (
-                f"The LLM-generated narrative analysis report was written to "
+                f"[{severity}] {event_type}: The LLM-generated narrative analysis report was written to "
                 f"`{event.details.get('report_path', '?')}`. "
                 f"The report contains {event.details.get('word_count', 0)} words "
                 f"across {len(event.details.get('sections', []))} sections: "
@@ -333,7 +411,7 @@ class LLMNarrator:
                 f"for SOC analysts to review the day's findings."
             ),
             EventType.RULE_CONFIDENCE_UPDATED: (
-                f"Correlation rule {event.details.get('rule_id', '?')} confidence "
+                f"[{severity}] {event_type}: Correlation rule {event.details.get('rule_id', '?')} confidence "
                 f"was updated from {event.details.get('old_confidence', '?')} to "
                 f"{event.details.get('new_confidence', '?')} "
                 f"(delta: {event.details.get('delta', 0):+g}). "
@@ -343,7 +421,7 @@ class LLMNarrator:
                 f"Confidence scoring helps prioritize which rules to trust."
             ),
             EventType.RULE_RETIRED: (
-                f"ALERT: Correlation rule {event.details.get('rule_id', '?')} has been "
+                f"[{severity}] {event_type}: ALERT: Correlation rule {event.details.get('rule_id', '?')} has been "
                 f"RETIRED because its confidence dropped to "
                 f"{event.details.get('confidence', 0)} — below the 0.20 threshold. "
                 f"This rule will no longer trigger on new alerts until its confidence "
@@ -351,7 +429,7 @@ class LLMNarrator:
                 f"be reviewed to determine if they need re-tuning."
             ),
             EventType.WATCHLIST_UPDATED: (
-                f"The watchlist was modified in this analysis run: "
+                f"[{severity}] {event_type}: The watchlist was modified in this analysis run: "
                 f"{event.details.get('additions', 0)} new entries were added, "
                 f"{event.details.get('modifications', 0)} existing entries were modified, "
                 f"and {event.details.get('expirations', 0)} entries expired. "
@@ -359,20 +437,20 @@ class LLMNarrator:
                 f"about which entities are associated with malicious activity."
             ),
             EventType.FALSE_NEGATIVE_RECORDED: (
-                f"A new confirmed false negative was recorded: "
+                f"[{severity}] {event_type}: A new confirmed false negative was recorded: "
                 f"`{json.dumps(event.details)[:200]}`. "
                 f"False negatives represent incidents or alerts that the "
                 f"correlation engine failed to flag but were later identified "
                 f"as security-relevant. These entries help improve rule accuracy."
             ),
             EventType.DAILY_STATS_APPENDED: (
-                f"Daily summary statistics were appended to the historical record. "
+                f"[{severity}] {event_type}: Daily summary statistics were appended to the historical record. "
                 f"Stats: {json.dumps(event.details)[:200]}. "
                 f"This data feeds trend analysis and anomaly detection for "
                 f"identifying shifts in the security alert landscape."
             ),
             EventType.VOLUME_SPIKE_DETECTED: (
-                f"ANOMALY DETECTED: Alert volume for category "
+                f"[{severity}] {event_type}: ANOMALY DETECTED: Alert volume for category "
                 f"'{event.details.get('category', '?')}' spiked to "
                 f"{event.details.get('current_count', 0)} alerts, "
                 f"far exceeding the 7-day rolling average of "
@@ -383,14 +461,14 @@ class LLMNarrator:
                 f"whether it represents a real attack surge or a benign event."
             ),
             EventType.NEW_ALERT_TITLE_DETECTED: (
-                f"A new alert title was detected that has not appeared "
+                f"[{severity}] {event_type}: A new alert title was detected that has not appeared "
                 f"in the prior 7 days: '{event.details.get('title', '?')}'. "
                 f"New alert types may indicate changes in the threat landscape, "
                 f"new detection rules deployed by Microsoft, or novel attack "
                 f"techniques being used against the organization."
             ),
             EventType.HIGH_RISK_ENTITY_OBSERVED: (
-                f"High-risk entity observed: "
+                f"[{severity}] {event_type}: High-risk entity observed: "
                 f"{event.details.get('entity_type', '?')} = "
                 f"`{event.details.get('entity_value', '?')}` "
                 f"appeared in {event.details.get('incident_count', 0)} "
@@ -399,14 +477,14 @@ class LLMNarrator:
                 f"are prime candidates for watchlisting and closer monitoring."
             ),
             EventType.PIPELINE_RUN_STARTED: (
-                f"The MXDR daily analysis pipeline began processing "
+                f"[{severity}] {event_type}: The MXDR daily analysis pipeline began processing "
                 f"for date {event.details.get('date', '?')}. "
                 f"This marks the start of the automated security analysis "
                 f"workflow including alert ingestion, correlation, "
                 f"clustering, prioritization, and reporting."
             ),
             EventType.PIPELINE_RUN_COMPLETED: (
-                f"The MXDR daily analysis pipeline completed successfully "
+                f"[{severity}] {event_type}: The MXDR daily analysis pipeline completed successfully "
                 f"for {event.details.get('date', '?')} in "
                 f"{event.details.get('duration_seconds', 0):.1f} seconds, "
                 f"producing {event.details.get('event_count', 0)} audit events. "
@@ -417,7 +495,7 @@ class LLMNarrator:
 
         template = narratives.get(
             event.event_type if isinstance(event.event_type, EventType) else None,
-            self._generic_narrative(event),
+            LLMNarrator._generic_narrative(event),
         )
         return template
 
@@ -432,7 +510,7 @@ class LLMNarrator:
             f"This event was recorded from source: {event.source_file}."
         )
 
-    # ── Template report ───────────────────────────────────────────────────
+    # Template report
 
     @staticmethod
     def _template_report(events: List[AuditEvent], date_str: str) -> str:
@@ -440,7 +518,7 @@ class LLMNarrator:
         lines = [
             f"# 🔍 MXDR Audit Log — {date_str}",
             "",
-            f"**Generated At**: {datetime.utcnow().isoformat()}Z",
+            f"**Generated At**: {datetime.now().isoformat()}Z",
             f"**Total Events**: {len(events)}",
             "",
             "---",
@@ -496,7 +574,7 @@ class LLMNarrator:
             lines.append("")
             lines.append(f"**Narrative**:")
             lines.append("")
-            narrative = event.llm_narrative or self._template_narrative(event)
+            narrative = event.llm_narrative or LLMNarrator.template_narrative(event)
             lines.append(narrative)
             lines.append("")
             lines.append(f"**Raw Snippet**:")

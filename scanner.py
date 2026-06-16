@@ -8,10 +8,8 @@ narrative report, correlation rules, etc.) has its own scanning logic.
 
 import json
 import logging
-from collections import Counter
-from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, cast
 
 import yaml
 
@@ -19,8 +17,6 @@ from agent_trace import get_logger, instrument
 from config import Config
 from events import (
     AuditEvent,
-    EventType,
-    Severity,
     make_alert_ingestion_event,
     make_packet_generated_event,
     make_rule_triggered_event,
@@ -38,7 +34,6 @@ from events import (
     make_volume_spike_event,
     make_high_risk_entity_event,
     make_pipeline_start_event,
-    make_pipeline_complete_event,
 )
 
 logger = logging.getLogger(__name__)
@@ -67,7 +62,7 @@ class ArtifactScanner:
         # Snapshot path for diff-based change detection
         self._snapshot_dir = config.snapshot_dir
 
-    # ── Main entry point ──────────────────────────────────────────────────
+    # Main entry point
 
     def scan_all(self) -> List[AuditEvent]:
         """Scan all available artifacts and return a sorted event list."""
@@ -98,7 +93,7 @@ class ArtifactScanner:
 
         return self.events
 
-    # ── Analysis packet ──────────────────────────────────────────────────
+    # Analysis packet
 
     def _scan_analysis_packet(self):
         """Parse the analysis packet JSON and generate ingestion + rule events."""
@@ -183,7 +178,7 @@ class ArtifactScanner:
                     source=source,
                 ))
 
-    # ── Narrative report ─────────────────────────────────────────────────
+    # Narrative report
 
     def _scan_narrative_report(self):
         """Parse the markdown narrative report and extract section info."""
@@ -229,7 +224,7 @@ class ArtifactScanner:
                     source=source,
                 ))
 
-    # ── Clusters ─────────────────────────────────────────────────────────
+    # Clusters
 
     def _scan_clusters(self):
         """Parse clusters YAML file."""
@@ -249,7 +244,7 @@ class ArtifactScanner:
 
         self.events.append(make_clusters_generated_event(clusters, source=source))
 
-    # ── SOC queue ────────────────────────────────────────────────────────
+    # SOC queue
 
     def _scan_soc_queue(self):
         """Parse SOC queue YAML file."""
@@ -269,11 +264,11 @@ class ArtifactScanner:
 
         self.events.append(make_soc_queue_generated_event(items, source=source))
 
-    # ── Correlation rules ────────────────────────────────────────────────
+    # Correlation rules
 
     def _scan_correlation_rules(self):
         """
-        Parse correlation_rules.yaml and compare with cached snapshot to
+        Parse correlation_rules.yaml and compare with a cached snapshot to
         detect confidence changes and retirements.
         """
         rules_path: Path = self.config.artifact("correlation_rules")
@@ -313,20 +308,20 @@ class ArtifactScanner:
                 # New rule, no history to compare
                 continue
 
-            old_conf = prev.get("confidence", 0.5)
-            new_conf = current.get("confidence", 0.5)
+            old_conf = cast(float, prev.get("confidence", 0.5))
+            new_conf = cast(float, current.get("confidence", 0.5))
 
             if abs(new_conf - old_conf) > 0.001:
                 self.events.append(make_rule_confidence_updated_event(
                     rule_id=rid,
                     old_confidence=old_conf,
                     new_confidence=new_conf,
-                    hit_count=current.get("hit_count", 0),
-                    last_triggered=current.get("last_triggered"),
+                    hit_count=cast(int, current.get("hit_count", 0)),
+                    last_triggered=cast(Optional[str], current.get("last_triggered")),
                     source=source,
                 ))
 
-            if new_conf < 0.20 and old_conf >= 0.20:
+            if new_conf < 0.20 <= old_conf:
                 self.events.append(make_rule_retired_event(
                     rule_id=rid,
                     confidence=new_conf,
@@ -336,7 +331,7 @@ class ArtifactScanner:
         # Save current state as snapshot for next run
         self._save_snapshot(snapshot_path, current_rules)
 
-    # ── Watchlist ────────────────────────────────────────────────────────
+    # Watchlist
 
     def _scan_watchlist(self):
         """
@@ -394,7 +389,7 @@ class ArtifactScanner:
         # Save snapshot
         self._save_snapshot(snapshot_path, current_entries)
 
-    # ── False negatives ──────────────────────────────────────────────────
+    # False negatives──
 
     def _scan_false_negatives(self):
         """
@@ -424,7 +419,7 @@ class ArtifactScanner:
         # Save snapshot
         self._save_snapshot(snapshot_path, current_entries)
 
-    # ── Daily stats ──────────────────────────────────────────────────────
+    # Daily stats──────
 
     def _scan_daily_stats(self):
         """
@@ -506,9 +501,9 @@ class ArtifactScanner:
                             source=source,
                         ))
 
-    # ── Snapshot helpers ─────────────────────────────────────────────────
-
-    def _load_snapshot(self, path: Path) -> Optional[List[Dict]]:
+    # Snapshot helpers
+    @staticmethod
+    def _load_snapshot(path: Path) -> Optional[List[Dict]]:
         """Load a cached snapshot from disk."""
         if not path.exists():
             return None
@@ -518,7 +513,8 @@ class ArtifactScanner:
             return data
         return None
 
-    def _save_snapshot(self, path: Path, data: List[Dict]):
+    @staticmethod
+    def _save_snapshot(path: Path, data: List[Dict]):
         """Save a snapshot to disk for future diff comparison."""
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:

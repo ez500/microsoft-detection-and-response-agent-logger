@@ -12,7 +12,6 @@ Orchestrates: ArtifactScanner → LLMNarrator → AuditLogWriter
 
 import argparse
 import sys
-import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -87,9 +86,9 @@ def main(argv: Optional[list] = None) -> int:
         0 on success, 1 on failure.
     """
     args = parse_args(argv)
-    start_time = datetime.utcnow()
+    start_time = datetime.now()
 
-    # ── Load configuration ────────────────────────────────────────────────
+    # Load configuration
     config = Config.from_env()
 
     # Override agent root if provided on CLI
@@ -101,7 +100,7 @@ def main(argv: Optional[list] = None) -> int:
 
     target_date = resolve_date(args)
 
-    # ── Initialize AgentTrace ─────────────────────────────────────────────
+    # Initialize AgentTrace
     agent_trace.init(
         agent_name=config.trace_agent_name,
         log_dir=config.trace_log_dir,
@@ -123,7 +122,7 @@ def main(argv: Optional[list] = None) -> int:
     print(f"   Skip LLM:   {args.skip_llm}")
     print()
 
-    # ── Step 1: Scan artifacts ────────────────────────────────────────────
+    # Step 1: Scan artifacts
     print("[1/3] Scanning analysis artifacts...")
     scanner = ArtifactScanner(config, target_date)
     events = scanner.scan_all()
@@ -133,7 +132,7 @@ def main(argv: Optional[list] = None) -> int:
         print("       ⚠ No events found. Are the artifact paths correct?")
         print(f"       Expected analysis packet at: {config.artifact('packet') / f'{target_date}.json'}")
 
-    # ── Step 2: Narrate events ────────────────────────────────────────────
+    # Step 2: Narrate events
     print("[2/3] Narrating events...")
     narrator = LLMNarrator(config)
 
@@ -141,17 +140,17 @@ def main(argv: Optional[list] = None) -> int:
         print(f"       → Using template narration "
               f"({'dry run' if args.dry_run else '--skip-llm set'})")
         for event in events:
-            event.llm_narrative = narrator._template_narrative(event)
+            event.llm_narrative = narrator.template_narrative(event)
     else:
         if narrator.available:
-            print(f"       → Using Gemini ({config.llm_model})")
+            print(f"       → Using {narrator.active_model_name}")
         else:
-            print(f"       → Gemini unavailable, using template fallback")
+            print(f"       → LLM unavailable, using template fallback")
         events = narrator.narrate_events(events)
 
     print(f"       → {len(events)} events narrated")
 
-    # ── Step 3: Generate report and write output ──────────────────────────
+    # Step 3: Generate report and write output
     print("[3/3] Generating report and writing output...")
 
     if args.dry_run:
@@ -161,7 +160,7 @@ def main(argv: Optional[list] = None) -> int:
         for event in events:
             print(f"  [{event.severity.value}] {event.event_type.value}: {event.raw_snippet[:120]}")
         print()
-        elapsed = (datetime.utcnow() - start_time).total_seconds()
+        elapsed = (datetime.now() - start_time).total_seconds()
         print(f"Done. {len(events)} events in {elapsed:.1f}s (dry run, no files written)")
         return 0
 
@@ -178,11 +177,11 @@ def main(argv: Optional[list] = None) -> int:
     )
 
     # Override with actual timing
-    elapsed = (datetime.utcnow() - start_time).total_seconds()
+    elapsed = (datetime.now() - start_time).total_seconds()
     result["duration_seconds"] = round(elapsed, 1)
 
     print()
-    # ── Shutdown AgentTrace ──────────────────────────────────────────────
+    # Shutdown AgentTrace
     trace_event_count = 0
     if _trace_logger:
         trace_event_count = _trace_logger.events_written
