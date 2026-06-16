@@ -19,7 +19,7 @@ from events import AuditEvent, EventType, Severity
 logger = logging.getLogger(__name__)
 
 
-@instrument(agent_name="LLMNarrator")
+@instrument(agent_name="LLMNarrator", methods=["narrate_events", "generate_report"])
 class LLMNarrator:
     """
     Enhances structured audit events with LLM-generated verbose narratives
@@ -108,7 +108,7 @@ class LLMNarrator:
 
         # Fallback: template-based narration
         for event in events:
-            event.llm_narrative = self.template_narrative(event)
+            event.llm_narrative = LLMNarrator.template_narrative(event)
         return events
 
     def generate_report(self, events: List[AuditEvent], date_str: str) -> str:
@@ -227,7 +227,7 @@ class LLMNarrator:
             if i in narratives:
                 event.llm_narrative = narratives[i]
             else:
-                event.llm_narrative = self.template_narrative(event)
+                event.llm_narrative = LLMNarrator.template_narrative(event)
 
         return events
 
