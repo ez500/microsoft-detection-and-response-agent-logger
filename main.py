@@ -100,17 +100,20 @@ def main(argv: Optional[list] = None) -> int:
 
     target_date = resolve_date(args)
 
-    # Initialize AgentTrace
+    # Initialize AgentTrace (per AgentTrace §Python Module Layout)
     agent_trace.init(
         agent_name=config.trace_agent_name,
         log_dir=config.trace_log_dir,
         enable_otel=config.enable_otel and not args.dry_run,
         otel_endpoint=config.otel_endpoint if config.enable_otel else None,
         verbose=config.verbose,
+        auto_instrument=config.auto_instrument,
+        mirror_contextual_to_jsonl=config.mirror_contextual_to_jsonl,
     )
 
-    # Instrument the pipeline classes (decorators already applied, just ensure logging)
-    from agent_trace import get_logger
+    # Pipeline classes are already instrumented via @instrument() class decorators;
+    # get the global ALogger to report event counts at shutdown.
+    from agent_trace import get_logger, instrument_agent
     _trace_logger = get_logger()
     if _trace_logger and config.verbose:
         print(f"   AgentTrace: enabled (jsonl={config.trace_log_dir}/traces.jsonl"
@@ -125,6 +128,9 @@ def main(argv: Optional[list] = None) -> int:
     # Step 1: Scan artifacts
     print("[1/3] Scanning analysis artifacts...")
     scanner = ArtifactScanner(config, target_date)
+    # Per AgentTrace §Python Module Layout: instrument_agent(obj, name, methods)
+    # — wraps selected public callables on an existing agent instance.
+    instrument_agent(scanner, name="ArtifactScanner")
     events = scanner.scan_all()
     print(f"       → {len(events)} events extracted")
 
@@ -135,6 +141,10 @@ def main(argv: Optional[list] = None) -> int:
     # Step 2: Narrate events
     print("[2/3] Narrating events...")
     narrator = LLMNarrator(config)
+    instrument_agent(
+        narrator, name="LLMNarrator",
+        methods=["narrate_events", "generate_report"],
+    )
 
     if args.skip_llm or args.dry_run:
         print(f"       → Using template narration "
@@ -169,6 +179,7 @@ def main(argv: Optional[list] = None) -> int:
 
     # Write all outputs
     writer = AuditLogWriter(config)
+    instrument_agent(writer, name="AuditLogWriter")
     result = writer.write_all(
         events=events,
         report_content=report_content,

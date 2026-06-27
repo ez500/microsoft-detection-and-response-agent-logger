@@ -28,10 +28,11 @@ import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 from otel_exporter import OTelExporter
 from trace_schema import (
+    SchemaValidationError,
     SpanKind,
     TraceEvent,
     TraceLevel,
@@ -125,10 +126,16 @@ class ALogger:
         agent_name: str = "agent",
         log_dir: Optional[Path] = None,
         otel_exporter: Optional[OTelExporter] = None,
+        mirror_contextual_to_jsonl: bool = False,
     ):
         self.agent_name = agent_name
         self.log_dir = log_dir
         self.otel_exporter = otel_exporter
+        # Per AgentTrace §Log Schema and Local Sinks:
+        # "Operational and cognitive events are persisted to JSONL, while contextual
+        # events are primarily exported via OTel with optional file mirroring for
+        # offline workflows."
+        self.mirror_contextual_to_jsonl = mirror_contextual_to_jsonl
         self._events_written: int = 0
         self._jsonl_path: Optional[Path] = None
 
@@ -327,23 +334,53 @@ class ALogger:
     # Internal write logic───────
 
     def _write_event(self, event: TraceEvent):
-        """Write a trace event to JSONL and optionally export to OTel."""
+        """
+        Write a trace event using the dual-path strategy from AgentTrace
+        §Log Schema and Local Sinks:
+
+          * Operational and cognitive → JSONL (always) + OTel (if enabled)
+          * Contextual               → OTel (primary)  + JSONL (optional mirror)
+
+        OTel export failures degrade gracefully to JSONL (per §Implementation:
+        "Exporter failures gracefully degrade to local JSONL").
+        """
         self._events_written += 1
 
-        # Always write to JSONL
-        if self._jsonl_path is not None:
+        # AgentTrace §Implementation: "All records are validated at emission
+        # time against the schema to maintain consistency."
+        try:
+            event.validate()
+        except SchemaValidationError as e:
+            logger.warning(f"Dropping schema-invalid trace event: {e}")
+            return
+
+        is_contextual = event.surface == TraceSurface.CONTEXTUAL
+        otel_active = self.otel_exporter is not None and self.otel_exporter.enabled
+        otel_succeeded = False
+
+        # 1. Export to OTel first (primary path for contextual; secondary for others)
+        if otel_active:
+            try:
+                otel_succeeded = bool(self.otel_exporter.export_event(event))
+            except Exception as e:
+                logger.debug(f"OTel export failed (non-critical): {e}")
+                otel_succeeded = False
+
+        # 2. Write to JSONL according to the surface routing policy
+        should_write_jsonl = (
+            self._jsonl_path is not None
+            and (
+                not is_contextual                       # op/cog: always JSONL
+                or self.mirror_contextual_to_jsonl      # contextual: only if mirroring
+                or not otel_succeeded                   # graceful degradation
+            )
+        )
+        if should_write_jsonl:
             try:
                 with open(self._jsonl_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(event.to_dict(), default=str) + "\n")
             except OSError as e:
                 logger.warning(f"Failed to write trace event to JSONL: {e}")
-
-        # Optionally export to OTel
-        if self.otel_exporter is not None and self.otel_exporter.enabled:
-            try:
-                self.otel_exporter.export_event(event)
-            except Exception as e:
-                logger.debug(f"OTel export failed (non-critical): {e}")
 
     @property
     def events_written(self) -> int:
@@ -370,12 +407,16 @@ def init(
     otel_endpoint: Optional[str] = None,
     service_name: str = "MXDR_logging",
     verbose: bool = False,
+    auto_instrument: bool = True,
+    mirror_contextual_to_jsonl: bool = False,
 ):
     """
     Initialize AgentTrace instrumentation.
 
-    Configures local sinks (JSONL), initializes OTel export if enabled,
-    and registers the global ALogger instance.
+    Per AgentTrace §Python Module Layout and Initialization:
+      "Initialization loads configuration, prepares append-only JSONL outputs,
+       and, when enabled, activates OTel auto-instrumentation for common I/O
+       libraries."
 
     Args:
         agent_name: Name of the agent being traced.
@@ -384,6 +425,11 @@ def init(
         otel_endpoint: OTLP gRPC endpoint (e.g., "http://localhost:4317").
         service_name: OTel service name.
         verbose: Enable verbose logging.
+        auto_instrument: When OTel is enabled, activate auto-instrumentation
+            for HTTP / DB / cache libraries to capture contextual I/O spans
+            (per AgentTrace §Contextual Surface).
+        mirror_contextual_to_jsonl: When True, also write contextual events
+            to JSONL (paper: "optional file mirroring for offline workflows").
     """
     global _logger_instance
 
@@ -407,16 +453,53 @@ def init(
             logger.warning(f"Failed to initialize OTel exporter: {e}")
             otel_exporter = None
 
+        # Activate auto-instrumentation hooks for contextual surface
+        # (HTTP, SQL, cache libs). See AgentTrace §Contextual Surface.
+        if otel_exporter is not None and otel_exporter.enabled and auto_instrument:
+            _activate_auto_instrumentation(verbose=verbose)
+
     _logger_instance = ALogger(
         agent_name=agent_name,
         log_dir=log_dir,
         otel_exporter=otel_exporter,
+        mirror_contextual_to_jsonl=mirror_contextual_to_jsonl,
     )
 
     logger.info(
         f"AgentTrace initialized: agent={agent_name}, "
-        f"log_dir={log_dir}, otel={enable_otel}"
+        f"log_dir={log_dir}, otel={enable_otel}, "
+        f"auto_instrument={auto_instrument and enable_otel}"
     )
+
+
+def _activate_auto_instrumentation(verbose: bool = False) -> List[str]:
+    """
+    Attempt to activate OpenTelemetry auto-instrumentation for common I/O
+    libraries (requests, urllib3, sqlalchemy, redis). Missing instrumentations
+    are silently skipped — graceful degradation per AgentTrace §Engineering
+    Considerations.
+
+    Returns the list of successfully activated instrumentations.
+    """
+    activated: List[str] = []
+    instrumentations = [
+        ("opentelemetry.instrumentation.requests", "RequestsInstrumentor"),
+        ("opentelemetry.instrumentation.urllib3", "URLLib3Instrumentor"),
+        ("opentelemetry.instrumentation.urllib", "URLLibInstrumentor"),
+        ("opentelemetry.instrumentation.sqlalchemy", "SQLAlchemyInstrumentor"),
+        ("opentelemetry.instrumentation.redis", "RedisInstrumentor"),
+    ]
+    for module_path, class_name in instrumentations:
+        try:
+            mod = __import__(module_path, fromlist=[class_name])
+            instrumentor_cls = getattr(mod, class_name)
+            instrumentor_cls().instrument()
+            activated.append(class_name)
+            if verbose:
+                logger.info(f"AgentTrace auto-instrumentation: {class_name} activated")
+        except Exception as e:
+            logger.debug(f"AgentTrace auto-instrumentation: skipped {class_name} ({e})")
+    return activated
 
 
 def shutdown():
@@ -489,6 +572,52 @@ def instrument(
     return class_decorator
 
 
+def instrument_agent(
+    obj: Any,
+    name: Optional[str] = None,
+    methods: Optional[Sequence[str]] = None,
+) -> Any:
+    """
+    Instrument an already-constructed agent *instance* at runtime.
+
+    This is the API named in AgentTrace §Python Module Layout:
+      ``instrument_agent(obj, name, methods=None)`` —
+      "wraps selected public callables for runtime tracing."
+
+    It mirrors Algorithm 1 (input: agent instance A, name n, optional allowlist
+    M) by installing per-instance wrappers on bound methods of ``obj``.
+
+    Args:
+        obj: The agent instance to instrument (in place).
+        name: Logical agent name used in trace events. Defaults to class name.
+        methods: Optional allowlist of public method names. If None, every
+                 public instance method is wrapped.
+
+    Returns:
+        The same ``obj`` instance, now instrumented.
+    """
+    agent_name = name or type(obj).__name__
+    target_methods = _select_methods(type(obj), methods)
+    for method_name in target_methods:
+        bound = getattr(obj, method_name, None)
+        if bound is None or not callable(bound) or method_name.startswith("_"):
+            continue
+        # Idempotency: skip if this bound method is already wrapped.
+        if getattr(bound, "__agenttrace_instrumented__", False):
+            continue
+        wrapped = _make_wrapper(bound, agent_name, method_name)
+        try:
+            setattr(wrapped, "__agenttrace_instrumented__", True)
+        except (AttributeError, TypeError):
+            pass
+        try:
+            setattr(obj, method_name, wrapped)
+        except (AttributeError, TypeError) as e:
+            # Instances using __slots__ may forbid attribute assignment; skip.
+            logger.debug(f"instrument_agent: skipped {method_name} ({e})")
+    return obj
+
+
 def _select_methods(cls, allowlist: Optional[Sequence[str]] = None) -> List[str]:
     """Select public methods to instrument from a class."""
     if allowlist is not None:
@@ -532,12 +661,15 @@ def _make_wrapper(
         parent_span_id = TraceContext.get_current_span_id() or None
 
         # 2. Record START event
+        # Per AgentTrace §Operational Surface, start/complete events are
+        # enriched with "argument count, result type, and execution duration".
         args_summary = _summarize_args(args, kwargs)
         alogger.record_operational_start(
             method=method_name,
             trace_id=trace_id,
             span_id=span_id,
             args_summary=args_summary,
+            args_count=len(args) + len(kwargs),
         )
 
         # Set context for nested spans
@@ -545,11 +677,14 @@ def _make_wrapper(
         t0 = time.monotonic()
 
         try:
-            # 3. Call the original function
+            # 3. Call the original function: y ← f(x)
             result = func(*args, **kwargs)
 
-            # 4. Attempt cognitive extraction from result
-            cognitive_extracted = _maybe_extract_cognitive(
+            # 4. Cognitive extraction (Algorithm 1, line 10):
+            #    (y, θ) ← maybe_extract_cognitive(y)
+            # Paper: returns the cleaned answer and logs the segment as a
+            # cognitive event; otherwise, results pass through unmodified.
+            result, _cognitive_extracted = _maybe_extract_cognitive(
                 result, agent_name, trace_id, span_id
             )
 
@@ -561,6 +696,7 @@ def _make_wrapper(
                 span_id=span_id,
                 duration_ms=duration_ms,
                 result_summary=result_summary,
+                result_type=type(result).__name__,
             )
 
             # Restore parent context
@@ -590,6 +726,11 @@ def _make_wrapper(
             # Re-raise to preserve semantics
             raise
 
+    # Mark the wrapper so instrument_agent() can detect double-instrumentation.
+    try:
+        setattr(wrapper, "__agenttrace_instrumented__", True)
+    except (AttributeError, TypeError):
+        pass
     return wrapper
 
 
@@ -601,55 +742,85 @@ def _maybe_extract_cognitive(
     agent_name: str,
     trace_id: str,
     span_id: str,
-) -> bool:
+) -> Tuple[Any, bool]:
     """
-    Attempt to extract cognitive segments from a function result.
+    Algorithm 1, line 10:  (y, θ) ← maybe_extract_cognitive(y)
+
+    Per AgentTrace §Cognitive trace extraction:
+      "When completions include a delimited reasoning segment, AgentTrace
+       returns the cleaned answer and logs the segment as a cognitive event;
+       otherwise, results pass through unmodified."
 
     Supports:
-    - Objects with a `.text` attribute (LLM responses)
-    - Strings containing <thinking>...</thinking> tags
-    - Dicts with 'plan', 'reflection', 'thought' keys
-    - Objects with a `candidates` attribute (LLM SDK response)
+      - Strings containing <thinking>...</thinking> / <plan>...</plan> tags
+        (returns the string with these segments stripped)
+      - Dicts with 'plan', 'reflection', 'thought' keys
+      - Objects with a `.text` attribute (LLM responses) — segments logged,
+        original object returned unmodified
+      - Objects with a `.candidates` attribute (LLM SDK responses)
 
-    Returns True if cognitive data was extracted and logged.
+    Returns (possibly_cleaned_result, extracted_flag).
     """
     alogger = get_logger()
     if alogger is None:
-        return False
+        return result, False
 
-    text = None
+    # Strings: extract cognitive segments AND strip them from the returned value
+    if isinstance(result, str):
+        extracted = _extract_cognitive_from_text(
+            result, alogger, agent_name, trace_id, span_id
+        )
+        cleaned = _strip_cognitive_markers(result) if extracted else result
+        return cleaned, extracted
 
-    # Try to extract text from various response types
-    if hasattr(result, "text"):
+    # Dicts: record cognitive fields once; pass dict through unmodified
+    if isinstance(result, dict):
+        extracted = False
+        if any(k in result for k in ("plan", "reflection", "thought", "reasoning")):
+            alogger.record_cognitive(
+                thought=result.get("thought") or result.get("reasoning"),
+                plan=result.get("plan"),
+                reflection=result.get("reflection"),
+                trace_id=trace_id,
+                span_id=span_id,
+                source="dict_field",
+            )
+            extracted = True
+        return result, extracted
+
+    # Objects with `.text` or LLM SDK `.candidates`
+    text: Optional[str] = None
+    if hasattr(result, "text") and isinstance(getattr(result, "text", None), str):
         text = result.text
-    elif isinstance(result, str):
-        text = result
-    elif isinstance(result, dict):
-        # Check for cognitive fields directly
-        for key in ("plan", "reflection", "thought", "reasoning"):
-            if key in result:
-                alogger.record_cognitive(
-                    thought=result.get("thought"),
-                    plan=result.get("plan"),
-                    reflection=result.get("reflection"),
-                    trace_id=trace_id,
-                    span_id=span_id,
-                    source=key,
-                )
-        return True
     elif hasattr(result, "candidates"):
-        # LLM SDK response (e.g., Google Generative AI)
         try:
             for candidate in result.candidates:
                 if hasattr(candidate, "content") and hasattr(candidate.content, "parts"):
-                    text = " ".join(p.text for p in candidate.content.parts if hasattr(p, "text"))
+                    text = " ".join(
+                        p.text for p in candidate.content.parts if hasattr(p, "text")
+                    )
         except Exception:
-            pass
+            text = None
 
     if text:
-        return _extract_cognitive_from_text(text, alogger, agent_name, trace_id, span_id)
+        extracted = _extract_cognitive_from_text(
+            text, alogger, agent_name, trace_id, span_id
+        )
+        # Do not mutate complex response objects — pass through.
+        return result, extracted
 
-    return False
+    return result, False
+
+
+def _strip_cognitive_markers(text: str) -> str:
+    """
+    Remove <thinking>...</thinking> and <plan>...</plan> delimited segments
+    from a string so the cleaned answer can be returned to the caller
+    (cf. AgentTrace §Cognitive trace extraction).
+    """
+    cleaned = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL)
+    cleaned = re.sub(r"<plan>.*?</plan>", "", cleaned, flags=re.DOTALL)
+    return cleaned.strip()
 
 
 def _extract_cognitive_from_text(
@@ -670,7 +841,6 @@ def _extract_cognitive_from_text(
     for segment in thinking_segments:
         alogger.record_cognitive(
             thought=segment,
-            model="",
             trace_id=trace_id,
             span_id=span_id,
             extraction_method="thinking_tag",
@@ -682,7 +852,6 @@ def _extract_cognitive_from_text(
     for segment in plan_segments:
         alogger.record_cognitive(
             plan=segment,
-            model="",
             trace_id=trace_id,
             span_id=span_id,
             extraction_method="plan_tag",

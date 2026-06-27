@@ -1,100 +1,164 @@
 """
 otel_exporter.py — OpenTelemetry Export Bridge for AgentTrace
 
-Converts TraceEvent objects to OpenTelemetry spans and exports them
-via OTel batch span processor. Gracefully degrades to local JSONL
-when OTel is unavailable or export fails.
+Converts ``TraceEvent`` objects into OpenTelemetry spans and exports them
+through an OTel batch span processor. Per AgentTrace §Implementation:
 
-Design follows AgentTrace §Implementation: OpenTelemetry Export and
-Auto-Instrumentation, with defensive attribute population and fallback.
+  "When enabled, AgentTrace converts each event into an OTel span and
+   exports via a batch processor. ... Exporter failures gracefully degrade
+   to local JSONL."
+
+Key design choices implemented here:
+
+  * Schema-driven attributes — surface-specific attribute namespacing is
+    owned by ``TraceEvent.to_otel_attributes`` in trace_schema.py, so this
+    file stays small and the schema remains authoritative.
+
+  * Causal nesting — every AgentTrace span carries the framework's own
+    ``trace_id`` / ``span_id`` / ``parent_span_id``. We honour those by
+    constructing a ``NonRecordingSpan`` with a synthetic ``SpanContext``
+    so the emitted OTel span participates in the *same* trace tree as its
+    parent. Without this, Jaeger / Tempo would show one orphan root span
+    per event and the §Methodology guarantee — "Span nesting and context
+    propagation enforce temporal causality across reasoning, tool, and
+    workflow events" — would be lost.
+
+  * Event-time spans — exports use the event's own UTC timestamp via
+    ``timestamp_ns`` so the backend visualises spans at the time the event
+    actually happened, not at export time. Duration (when known) is
+    applied to ``end_time`` accordingly.
+
+  * Transport flexibility — OTLP/gRPC (default) with automatic fallback to
+    OTLP/HTTP when the gRPC exporter is unavailable, and a console
+    exporter for offline development. Endpoint inference also honours the
+    ``OTEL_EXPORTER_OTLP_ENDPOINT`` environment variable for
+    interoperability with standard OTel deployments.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-from typing import Any, List, Optional, cast, Callable
+import os
+from typing import Any, Dict, List, Optional, Tuple
 
-from trace_schema import TraceEvent, TraceSurface, SpanKind
+from trace_schema import SpanKind, TraceEvent, TraceSurface
 
 logger = logging.getLogger(__name__)
 
-# Lazy OTel imports (optional dependency)
+
+# ────────────────────────────────────────────────────────────────────────
+# Lazy OpenTelemetry imports (optional dependency)
+# ────────────────────────────────────────────────────────────────────────
 
 _OTEL_AVAILABLE = False
 try:
     from opentelemetry import trace as otel_trace
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
-    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-    from opentelemetry.trace import SpanKind as OTelSpanKind
+    from opentelemetry.sdk.trace.export import (
+        BatchSpanProcessor,
+        SimpleSpanProcessor,
+        ConsoleSpanExporter,
+    )
+    from opentelemetry.trace import (
+        Link,
+        NonRecordingSpan,
+        SpanContext,
+        SpanKind as OTelSpanKind,
+        TraceFlags,
+        set_span_in_context,
+    )
     from opentelemetry.trace.status import Status, StatusCode
 
     _OTEL_AVAILABLE = True
-except ImportError:
+except ImportError:  # pragma: no cover - exercised only when OTel is absent
     otel_trace = None  # type: ignore
     Resource = None  # type: ignore
     TracerProvider = None  # type: ignore
     BatchSpanProcessor = None  # type: ignore
     SimpleSpanProcessor = None  # type: ignore
-    OTLPSpanExporter = None  # type: ignore
+    ConsoleSpanExporter = None  # type: ignore
+    Link = None  # type: ignore
+    NonRecordingSpan = None  # type: ignore
+    SpanContext = None  # type: ignore
     OTelSpanKind = None  # type: ignore
+    TraceFlags = None  # type: ignore
+    set_span_in_context = None  # type: ignore
     Status = None  # type: ignore
     StatusCode = None  # type: ignore
 
 
-# Surface → OTel span name mapping
+# ────────────────────────────────────────────────────────────────────────
+# Helpers
+# ────────────────────────────────────────────────────────────────────────
+
 def _span_name_from_event(event: TraceEvent) -> str:
     """Derive a human-readable span name from a trace event."""
+    agent = event.agent_name or "agent"
     if event.surface == TraceSurface.OPERATIONAL:
         method = event.body.get("method", "unknown")
         status = event.body.get("status", "")
-        return f"{event.agent_name}.{method}.{status}" if status else f"{event.agent_name}.{method}"
-    elif event.surface == TraceSurface.COGNITIVE:
-        return f"{event.agent_name}.llm"
-    elif event.surface == TraceSurface.CONTEXTUAL:
+        return f"{agent}.{method}.{status}" if status else f"{agent}.{method}"
+    if event.surface == TraceSurface.COGNITIVE:
+        model = event.body.get("model")
+        return f"{agent}.llm.{model}" if model else f"{agent}.llm"
+    if event.surface == TraceSurface.CONTEXTUAL:
         op = event.body.get("operation", "io")
         source = event.body.get("source", "unknown")
-        return f"{event.agent_name}.{op}.{source}"
-    return f"{event.agent_name}.event"
+        return f"{agent}.{op}.{source}"
+    return f"{agent}.event"
 
 
-# Surface → OTel SpanKind mapping
 def _otel_span_kind(kind: SpanKind):
-    """Map AgentTrace SpanKind to OTel SpanKind."""
+    """Map AgentTrace ``SpanKind`` → OTel ``SpanKind``."""
     if OTelSpanKind is None:
         return None
-    mapping = {
+    return {
         SpanKind.INTERNAL: OTelSpanKind.INTERNAL,
         SpanKind.CLIENT: OTelSpanKind.CLIENT,
         SpanKind.SERVER: OTelSpanKind.SERVER,
         SpanKind.PRODUCER: OTelSpanKind.PRODUCER,
         SpanKind.CONSUMER: OTelSpanKind.CONSUMER,
-    }
-    return mapping.get(kind, OTelSpanKind.INTERNAL)
+    }.get(kind, OTelSpanKind.INTERNAL)
 
 
-# Defensive attribute serialization
-def _safe_set_attribute(span, key: str, value: Any):
-    """Set a span attribute with defensive type checking."""
+def _hex_to_int(value: str, width: int) -> Optional[int]:
+    """Parse ``value`` as a hex int of exactly ``width`` chars; return None on failure."""
+    if not value or len(value) != width:
+        return None
+    try:
+        return int(value, 16)
+    except ValueError:
+        return None
+
+
+def _otel_value(value: Any) -> Any:
+    """Coerce ``value`` into something OTel ``set_attribute`` accepts."""
     if value is None:
-        return
-    if isinstance(value, (str, bool, int, float)):
-        span.set_attribute(key, value)
-    elif isinstance(value, dict):
-        span.set_attribute(key, json.dumps(value, default=str))
-    else:
-        span.set_attribute(key, str(value))
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (str, int, float)):
+        return value
+    if isinstance(value, (list, tuple)):
+        if all(isinstance(x, (str, int, float, bool)) for x in value):
+            return list(value)
+        return [str(x) for x in value]
+    return str(value)
 
 
+# ────────────────────────────────────────────────────────────────────────
 # OTel Span Exporter
+# ────────────────────────────────────────────────────────────────────────
+
 class OTelExporter:
     """
-    Converts AgentTrace TraceEvents to OpenTelemetry spans and exports them.
+    Converts AgentTrace ``TraceEvent`` records to OpenTelemetry spans and
+    exports them through a (batch) span processor.
 
-    Graceful degradation: if OTel is not installed or export fails, all
-    methods are no-ops. The caller is responsible for fallback to JSONL.
+    Graceful degradation: if OTel is not installed, the constructor or
+    transport fails, or a single export call raises, methods become
+    no-ops and ALogger falls back to JSONL (per AgentTrace §Implementation).
     """
 
     def __init__(
@@ -102,6 +166,7 @@ class OTelExporter:
         service_name: str = "MXDR_logging",
         endpoint: Optional[str] = None,
         use_batch: bool = True,
+        resource_attributes: Optional[Dict[str, str]] = None,
     ):
         self._tracer = None
         self._provider = None
@@ -114,56 +179,130 @@ class OTelExporter:
             return
 
         try:
-            if not Resource:
-                return
-            resource = Resource.create({"service.name": service_name})
-            provider_class = TracerProvider
-            if provider_class is None:
-                return
-            self._provider = provider_class(resource=resource)
+            # Resource — service.name + optional supplemental attributes
+            attrs: Dict[str, str] = {"service.name": service_name}
+            if resource_attributes:
+                attrs.update(resource_attributes)
+            resource = Resource.create(attrs)  # type: ignore[union-attr]
+            self._provider = TracerProvider(resource=resource)  # type: ignore[misc]
 
-            # Configure exporter
-            if endpoint and OTLPSpanExporter is not None:
-                ExporterClass = cast(Callable[..., Any], cast(object, OTLPSpanExporter))
-                span_exporter = ExporterClass(endpoint=endpoint)
+            # Exporter — OTLP/gRPC → OTLP/HTTP → Console
+            endpoint = endpoint or os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+            span_exporter, transport = self._build_exporter(endpoint)
+            if span_exporter is None:
+                return
+
+            # Processor
+            processor_cls = (
+                BatchSpanProcessor if use_batch and BatchSpanProcessor is not None
+                else SimpleSpanProcessor
+            )
+            if processor_cls is None:
+                return
+            self._processor = processor_cls(span_exporter)
+            self._provider.add_span_processor(self._processor)
+
+            # Install provider only if a global one has not already been set
+            # (avoid clobbering an embedding application's tracer provider).
+            current = otel_trace.get_tracer_provider()  # type: ignore[union-attr]
+            if not isinstance(current, TracerProvider):  # type: ignore[arg-type]
+                otel_trace.set_tracer_provider(self._provider)  # type: ignore[union-attr]
+                self._tracer = self._provider.get_tracer(service_name)
             else:
-                # Use a console exporter as fallback (for development)
-                from opentelemetry.sdk.trace.export import ConsoleSpanExporter
-                span_exporter = ConsoleSpanExporter()
+                # Reuse the existing provider's tracer so we participate in
+                # the host application's trace pipeline.
+                self._tracer = current.get_tracer(service_name)
 
-            # Span processor
-            if use_batch and BatchSpanProcessor is not None:
-                self._processor = BatchSpanProcessor(span_exporter)
-            elif SimpleSpanProcessor is not None:
-                self._processor = SimpleSpanProcessor(span_exporter)
-
-            if self._processor is not None:
-                self._provider.add_span_processor(self._processor)
-
-            if not otel_trace:
-                return
-            otel_trace.set_tracer_provider(self._provider)
-
-            tracer_provider = otel_trace.get_tracer_provider() if otel_trace else None
-            self._tracer = tracer_provider.get_tracer(service_name) if tracer_provider else None
             self._enabled = self._tracer is not None
-
-            logger.info(f"OTel exporter initialized (endpoint={endpoint or 'console'})")
+            logger.info(
+                f"OTel exporter initialized "
+                f"(service={service_name}, transport={transport})"
+            )
         except Exception as e:
             logger.warning(f"Failed to initialize OTel exporter: {e}")
             self._enabled = False
 
+    # ────────────────────────────────────────────────────────────────────
+    # Transport selection
+    # ────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_exporter(endpoint: Optional[str]) -> Tuple[Any, str]:
+        """
+        Construct an OTLP span exporter, with graceful fallbacks:
+
+          1. OTLP/gRPC (if endpoint provided and grpc exporter available)
+          2. OTLP/HTTP (fallback when gRPC isn't installed)
+          3. ConsoleSpanExporter (for offline development)
+
+        Returns (exporter, transport_label).
+        """
+        if endpoint:
+            # Try gRPC first
+            try:
+                from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+                    OTLPSpanExporter as GRPCExporter,
+                )
+                return GRPCExporter(endpoint=endpoint), f"otlp-grpc:{endpoint}"
+            except Exception as e:
+                logger.debug(f"OTLP/gRPC unavailable ({e}); trying OTLP/HTTP")
+            try:
+                from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+                    OTLPSpanExporter as HTTPExporter,
+                )
+                return HTTPExporter(endpoint=endpoint), f"otlp-http:{endpoint}"
+            except Exception as e:
+                logger.debug(f"OTLP/HTTP unavailable ({e}); falling back to console")
+
+        # Final fallback — console exporter for local development
+        if ConsoleSpanExporter is None:
+            return None, "none"
+        return ConsoleSpanExporter(), "console"
+
     @property
     def enabled(self) -> bool:
-        """Check if OTel export is available and configured."""
+        """Check whether OTel export is available and configured."""
         return self._enabled
+
+    # ────────────────────────────────────────────────────────────────────
+    # Causal context propagation
+    # ────────────────────────────────────────────────────────────────────
+
+    def _parent_context(self, event: TraceEvent):
+        """
+        Build an OTel ``Context`` that anchors the new span as a child of
+        the AgentTrace ``parent_span_id`` (or, if absent, as a root in the
+        same ``trace_id``). This is what realises the paper's claim of
+        nested causal spans across operational / cognitive / contextual
+        surfaces.
+        """
+        if NonRecordingSpan is None or SpanContext is None or set_span_in_context is None:
+            return None
+        parent_span_id = event.parent_span_id or event.span_id
+        trace_id_int = _hex_to_int(event.trace_id, 32)
+        span_id_int = _hex_to_int(parent_span_id, 16)
+        if trace_id_int is None or span_id_int is None:
+            return None
+        try:
+            ctx = SpanContext(
+                trace_id=trace_id_int,
+                span_id=span_id_int,
+                is_remote=False,
+                trace_flags=TraceFlags(TraceFlags.SAMPLED),  # type: ignore[arg-type]
+            )
+            return set_span_in_context(NonRecordingSpan(ctx))
+        except Exception as e:
+            logger.debug(f"Failed to build parent context: {e}")
+            return None
+
+    # ────────────────────────────────────────────────────────────────────
+    # Export
+    # ────────────────────────────────────────────────────────────────────
 
     def export_event(self, event: TraceEvent) -> bool:
         """
-        Export a single TraceEvent as an OTel span.
-
-        Returns True if the event was exported, False otherwise (caller
-        should fall back to JSONL).
+        Export a single ``TraceEvent`` as an OTel span. Returns ``True``
+        on success; ``False`` lets the caller fall back to JSONL.
         """
         if not self._enabled or self._tracer is None:
             return False
@@ -171,70 +310,71 @@ class OTelExporter:
         try:
             span_name = _span_name_from_event(event)
             otel_kind = _otel_span_kind(event.span_kind)
-
-            if not otel_kind:
+            if otel_kind is None:
                 return False
 
-            # Start a new span
+            # Causal anchoring: child of parent_span_id (if any) within trace_id.
+            parent_context = self._parent_context(event)
+
+            # Use the event's UTC timestamp so backends show the span at the
+            # time it actually happened, not at export time.
+            start_ns = event.timestamp_ns
+            end_ns: Optional[int] = None
+            if start_ns is not None and event.duration_ms is not None:
+                end_ns = start_ns + int(event.duration_ms * 1_000_000)
+
+            attributes = event.to_otel_attributes()
+            # Coerce values defensively (OTel attribute API rejects arbitrary types).
+            safe_attrs = {k: _otel_value(v) for k, v in attributes.items() if v is not None}
+
             span = self._tracer.start_span(
                 name=span_name,
+                context=parent_context,
                 kind=otel_kind,
-                attributes={
-                    "event_id": event.event_id,
-                    "surface": event.surface.value,
-                    "agent_name": event.agent_name,
-                    "level": event.level.value,
-                },
+                attributes=safe_attrs,
+                start_time=start_ns,
             )
 
-            # Add all body fields as attributes
-            for key, value in event.body.items():
-                _safe_set_attribute(span, f"body.{key}", value)
+            # Error semantics
+            if event.is_error and Status is not None and StatusCode is not None:
+                span.set_status(Status(StatusCode.ERROR, event.error or "unknown error"))
+                if event.error:
+                    try:
+                        span.record_exception(Exception(event.error))
+                    except Exception:
+                        pass
 
-            # Add tags
-            for key, value in event.tags.items():
-                _safe_set_attribute(span, f"tag.{key}", value)
-
-            # Set duration if available
-            if event.duration_ms is not None:
-                span.set_attribute("duration_ms", event.duration_ms)
-
-            # Set error status
-            if event.is_error:
-                if Status is not None and StatusCode is not None:
-                    span.set_status(Status(StatusCode.ERROR, event.error or "unknown error"))
-
-            span.end()
-
+            span.end(end_time=end_ns)
             return True
-        except Exception as e:
+        except Exception as e:  # pragma: no cover - defensive
             logger.warning(f"Failed to export OTel span: {e}")
             return False
 
     def export_events(self, events: List[TraceEvent]) -> int:
-        """
-        Export multiple TraceEvents as OTel spans.
-
-        Returns the number of successfully exported events.
-        """
+        """Export multiple ``TraceEvent``s; return success count."""
         count = 0
         for event in events:
             if self.export_event(event):
                 count += 1
         return count
 
-    def shutdown(self):
-        """Shutdown the OTel exporter gracefully."""
+    # ────────────────────────────────────────────────────────────────────
+    # Lifecycle
+    # ────────────────────────────────────────────────────────────────────
+
+    def shutdown(self) -> None:
+        """Shutdown the OTel exporter gracefully (flushes pending spans)."""
         if self._provider is not None:
             try:
                 self._provider.shutdown()
-            except Exception:
+            except Exception:  # pragma: no cover - defensive
                 pass
 
-    def force_flush(self):
-        """Force flush any pending spans."""
-        if self._provider is not None:
-            try:
-                self._provider.force_flush()
-            except Exception:
-                pass
+    def force_flush(self, timeout_millis: int = 5000) -> bool:
+        """Force flush any pending spans. Returns False on failure / no provider."""
+        if self._provider is None:
+            return False
+        try:
+            return bool(self._provider.force_flush(timeout_millis))
+        except Exception:  # pragma: no cover - defensive
+            return False

@@ -39,6 +39,14 @@ class Config:
     otel_endpoint: str = "http://localhost:4317"
     trace_log_dir: Path = Path("trace_logs")
     trace_agent_name: str = "MXDR_agent"
+    # When True, activate OTel auto-instrumentation for HTTP/DB/cache libs
+    # so that the contextual surface (per AgentTrace §Contextual Surface)
+    # is populated automatically when OTel is enabled.
+    auto_instrument: bool = True
+    # Optional file mirroring of contextual events to JSONL
+    # (AgentTrace §Log Schema: "optional file mirroring for offline workflows").
+    mirror_contextual_to_jsonl: bool = False
+
 
     # Verbosity
     verbose: bool = False
@@ -80,6 +88,11 @@ class Config:
             agent_root=Path(agent_root_str),
             enable_otel=os.getenv("ENABLE_OTEL", "").lower() in ("1", "true", "yes"),
             otel_endpoint=os.getenv("OTEL_ENDPOINT", "http://localhost:4317"),
+            auto_instrument=os.getenv("AGENTTRACE_AUTO_INSTRUMENT", "true").lower()
+                in ("1", "true", "yes"),
+            mirror_contextual_to_jsonl=os.getenv(
+                "AGENTTRACE_MIRROR_CONTEXTUAL", ""
+            ).lower() in ("1", "true", "yes"),
             verbose=os.getenv("VERBOSE", "").lower() in ("1", "true", "yes"),
         )
 
